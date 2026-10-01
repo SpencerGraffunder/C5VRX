@@ -1,3 +1,17 @@
+config C5VRX_RSSI_METER
+    bool "Build standalone ~1 kHz RSSI meter (no video output)"
+    default n
+    help
+        Replace the video pipeline with a race-timer RSSI meter. Boots the
+        same proven receive-only RF state (rf_start), tunes to 5800 MHz by
+        default (F<mhz> retunes at runtime), and streams RSSI / noise floor
+        over USB CDC at ~1 kHz while driving the six-bit video DAC (same
+        D4..D9 network, static GPIO writes) with the RSSI level. Excludes
+        PARLIO RX, BitScrambler, demodulators, menu and video output, and
+        reserves the MAC dump SRAM banks so the background continuous-modem
+        dump writer cannot corrupt heap. Video is deliberately sacrificed;
+        flash the normal firmware again for picture. See docs/rssi-meter.md.
+
 menu "C5VRX diagnostic probes"
     config C5VRX_PHY_PHASE_TAP_PROBE
         bool "Capture bounded MODEM_DIAG lane traces at boot, then start video"

@@ -904,6 +904,53 @@ static esp_err_t rf_set_channel_impl(size_t index)
     return ESP_OK;
 }
 
+esp_err_t rf_set_frequency_mhz(uint16_t freq_mhz)
+{
+    uint8_t wifi_channel = 0u;
+    uint16_t wifi_center_mhz = 0u;
+    if (!plan_wifi5_center(freq_mhz, &wifi_channel, &wifi_center_mhz)) {
+        printf("[RF:TUNE] Refusing %u MHz: outside ESP32-C5 5 GHz operating window %u-%u MHz\n",
+               freq_mhz, C5_WIFI5_MIN_MHZ, C5_WIFI5_MAX_MHZ);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    /* Supported bootstrap first: nearest public Wi-Fi center. */
+    esp_err_t err = esp_wifi_set_channel(wifi_channel, WIFI_SECOND_CHAN_NONE);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    uint8_t verify_primary = 0u;
+    wifi_second_chan_t verify_secondary = WIFI_SECOND_CHAN_NONE;
+    err = esp_wifi_get_channel(&verify_primary, &verify_secondary);
+    if (err != ESP_OK || verify_primary != wifi_channel) {
+        return (err != ESP_OK) ? err : ESP_ERR_INVALID_STATE;
+    }
+
+    if (freq_mhz != wifi_center_mhz) {
+        /* EXPERIMENTAL: same undocumented delta step as FPV retunes, kept
+         * minimal by starting from the nearest public center. */
+        phy_set_freq(freq_mhz, 0);
+    }
+
+    rf_enable_continuous_modem();
+
+    if (s_native_agc) {
+        phy_force_rx_gain(false, 0);
+    } else {
+        phy_disable_agc();
+        phy_rfagc_disable();
+    }
+    phy_wifi_fbw_sel(s_analog_bw40 ? 1u : 0u);
+    if (!s_native_agc) phy_force_rx_gain(true, s_current_gain_val);
+
+    arc_capture_vendor_state();
+
+    s_current_freq_mhz = freq_mhz;
+    s_current_offset_khz = 0;
+    return ESP_OK;
+}
+
 esp_err_t rf_set_channel(size_t index)
 {
 #ifdef C5VRX4_EXPERIMENT

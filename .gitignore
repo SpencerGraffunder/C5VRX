@@ -15,3 +15,6 @@ packages/
 release_download/
 *.log
 build_ci/
+build_*/
+sdkconfig.rssi-meter
+release-rssi-meter/

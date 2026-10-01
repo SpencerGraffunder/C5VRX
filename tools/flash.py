@@ -1,64 +1,57 @@
 #!/usr/bin/env python3
-"""Flash C5VRX-3 firmware to ESP32-C5 board."""
-import sys
+"""Flash C5VRX firmware to the ESP32-C5 board.
+
+Usage: python tools/flash.py COM10
+       python tools/flash.py COM10 --build-dir build_rssi_meter
+"""
+
 import subprocess
+import sys
 from pathlib import Path
-import serial.tools.list_ports
 
 ROOT = Path(__file__).resolve().parent.parent
-BUILD = ROOT / "build"
 
 
-def find_esp_port():
-    ports = serial.tools.list_ports.comports()
-    for p in ports:
-        desc = (p.description or "").upper()
-        hwid = (p.hwid or "").upper()
-        if "303A" in hwid or "ESPRESSIF" in desc or "USB JTAG" in desc or "USB-SERIAL" in desc:
-            return p.device
-    for p in ports:
-        if not (p.hwid or "").startswith("BTHENUM"):
-            return p.device
-    return "COM10"
+def main(port: str, build_dir: Path) -> None:
+    files = [build_dir / "bootloader" / "bootloader.bin",
+             build_dir / "partition_table" / "partition-table.bin",
+             build_dir / "c5vrx3.bin"]
+    missing = [str(path) for path in files if not path.exists()]
+    if missing:
+        raise SystemExit(f"Missing build artifacts: {missing}. Run: idf.py build")
 
-
-def main():
-    port = sys.argv[1] if len(sys.argv) > 1 else find_esp_port()
-
-    bootloader = BUILD / "bootloader/bootloader.bin"
-    ptable = BUILD / "partition_table/partition-table.bin"
-    app = BUILD / "c5vrx3.bin"
-
-    for f in (bootloader, ptable, app):
-        if not f.exists():
-            print(f"Error: {f} not found! Run build first.")
-            sys.exit(1)
-
-    print(f"=======================================================")
-    print(f" FLASHING C5VRX-3 (Seamless32K Phase5 Production)")
-    print(f" Port: {port}")
-    print(f" App:  {app}")
-    print(f"=======================================================")
-
-    cmd = [
-        sys.executable, "-m", "esptool",
+    command = [
+        "python", "-m", "esptool",
         "--chip", "esp32c5",
-        "-p", port,
-        "-b", "460800",
-        "--before", "usb-reset",
-        "--after", "watchdog-reset",
-        "write-flash",
+        "--port", port,
+        "--baud", "460800",
+        "--before", "usb_reset",
+        "--after", "watchdog_reset",
+        "write_flash",
         "--flash-mode", "dio",
         "--flash-size", "8MB",
         "--flash-freq", "80m",
-        "0x2000", str(bootloader),
-        "0x8000", str(ptable),
-        "0x10000", str(app),
+        "0x2000", str(files[0]),
+        "0x8000", str(files[1]),
+        "0x10000", str(files[2]),
     ]
-
-    res = subprocess.run(cmd)
-    sys.exit(res.returncode)
+    subprocess.check_call(command)
 
 
 if __name__ == "__main__":
-    main()
+    args = sys.argv[1:]
+    build_dir = ROOT / "build"
+    port = None
+    i = 0
+    while i < len(args):
+        if args[i] == "--build-dir" and i + 1 < len(args):
+            path = Path(args[i + 1])
+            build_dir = path if path.is_absolute() else ROOT / path
+            i += 2
+        else:
+            port = args[i]
+            i += 1
+    if port is None:
+        raise SystemExit(
+            "Usage: python tools/flash.py COM10 [--build-dir build_rssi_meter]")
+    main(port, build_dir)

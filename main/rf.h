@@ -144,6 +144,17 @@ const fpv_channel_t *rf_get_current_channel(void);
 size_t rf_get_channel_index(void);
 size_t rf_get_channel_count(void);
 esp_err_t rf_set_channel(size_t index);
+
+/**
+ * Arbitrary 5 GHz center for the standalone RSSI meter and the planned
+ * SPI frequency control. Two-step path shared with FPV channel retunes:
+ * first place the PHY on the nearest public Wi-Fi center (supported), then
+ * apply the phy_set_freq() delta (experimental, minimized by the nearest
+ * center). Re-asserts gain/BW ownership and the ARC vendor capture exactly
+ * like rf_set_channel_impl(). Only s_current_freq_mhz is updated; the FPV
+ * table band/index deliberately stay untouched.
+ */
+esp_err_t rf_set_frequency_mhz(uint16_t freq_mhz);
 esp_err_t rf_cycle_channel(void);
 
 fpv_band_t rf_get_current_band(void);

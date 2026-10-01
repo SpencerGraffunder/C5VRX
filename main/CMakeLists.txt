@@ -1,21 +1,28 @@
+set(c5vrx_sources
+    "main.c"
+    "bs_relative_worker_probe.c"
+    "bs_relative_middle_probe.c"
+    "phy_phase_tap_probe.c"
+    "bs_addctia_probe.c"
+    "arc_phy.c"
+    "arc_v3_controller.c"
+    "arc_v5_autotune.c"
+    "rx_auto_lab.c"
+    "rf.c"
+    "video.c"
+    "direct_gain.c"
+    "direct_gain_v2.c"
+    "direct_gain_v3.c"
+    "analog_video_detect.c"
+    "menu_raster.c")
+
+if(CONFIG_C5VRX_RSSI_METER)
+    # Standalone meter image: proven RF state only, no video pipeline.
+    set(c5vrx_sources "rssi_meter_main.c" "rf.c" "arc_phy.c")
+endif()
+
 idf_component_register(
-    SRCS
-        "main.c"
-        "bs_relative_worker_probe.c"
-        "bs_relative_middle_probe.c"
-        "phy_phase_tap_probe.c"
-        "bs_addctia_probe.c"
-        "arc_phy.c"
-        "arc_v3_controller.c"
-        "arc_v5_autotune.c"
-        "rx_auto_lab.c"
-        "rf.c"
-        "video.c"
-        "direct_gain.c"
-        "direct_gain_v2.c"
-        "direct_gain_v3.c"
-        "analog_video_detect.c"
-        "menu_raster.c"
+    SRCS ${c5vrx_sources}
     INCLUDE_DIRS "."
     REQUIRES
         esp_wifi
@@ -38,7 +45,9 @@ idf_component_register(
         esp_driver_gptimer
 )
 
-# Proven default plus opt-in experimental demod/output paths.
+# Proven default plus opt-in experimental demod/output paths. The meter
+# image has no BitScrambler and skips every .bsasm program.
+if(NOT CONFIG_C5VRX_RSSI_METER)
 target_bitscrambler_add_src("fm.bsasm")
 target_bitscrambler_add_src("fm_relative_golden.bsasm")
 target_bitscrambler_add_src("fm_phase5_360.bsasm")
@@ -51,4 +60,5 @@ target_bitscrambler_add_src("fm_phase8_hr_live.bsasm")
 target_bitscrambler_add_src("fm_hc.bsasm")
 if(C5VRX4_EXPERIMENT)
     include("${PROJECT_DIR}/component.cmake")
+endif()
 endif()
