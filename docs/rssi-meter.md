@@ -20,10 +20,24 @@ Follows the standalone capture-only meter pattern (see
   background continuous-modem dump writer keeps streaming into them
   (same reservation + ownership sanitize as the capture-only meter).
 - `main/rssi_meter_main.c` is the only application entry; `rf.c` + `arc_phy.c`
-  are shared unchanged with the normal image (except the new
-  `rf_set_frequency_mhz()` used by both).
+  are shared with the normal image (the new `rf_set_frequency_mhz()`,
+  `rf_get_channel_at()` and `rf_find_channel_by_freq()` are used by both).
+- Signal chain (`rssi_pipeline.c`): peak-hold + median + EMA + soft knee +
+  dBm to 0..255 calibration, shaping the raw RSSI before any output.
+- Optional analog sigma-delta output (`rssi_sdm.c`) for ~8-bit resolution,
+  and an optional RX5808 3-wire bus (`rx5808_bus.c`) that makes the meter a
+  drop-in replacement for the RX5808 module in an FPV lap timer.
+
+The pipeline, RX5808 bus and sigma-delta output are ports of FPVGateC5RX
+(https://github.com/LouisHitchcock/FPVGateC5RX, CC BY-NC-SA 4.0), adapted to
+this codebase's Kconfig/GPIO-LL conventions.
 
 ## Build
+
+```bash
+# Mac dev loop (build + flash + stream verification, one command):
+tools/flash_rssi_meter.sh /dev/cu.usbmodemXXXX [--no-build] [--manual]
+```
 
 ```sh
 . ~/esp/esp-idf/export.sh
@@ -43,21 +57,56 @@ Restore video afterwards: build the normal image and flash the same way
 without `--build-dir`. NVS is shared: `N` (AGC mode) persists across both
 images.
 
+### Flash size and merged images
+
+The C5 DevKit has **4 MB** flash; the XIAO board has 8 MB. The image header
+declares a flash size, and boot fails when the chip's flash is **smaller**
+than the header (`Detected size smaller than the size in the binary image
+header`). So build the meter for 4 MB (`CONFIG_ESPTOOLPY_FLASHSIZE_4MB` in
+the generated `sdkconfig.rssi-meter`) — a 4 MB-header image boots on both
+4 MB and 8 MB boards. An 8 MB-header image only boots on the 8 MB board.
+
+When creating a merged single-file image for the C5, the 2nd-stage
+bootloader lives at **0x2000** (not 0x0): the ROM reads its header from
+0x2000, so a merged image with the bootloader at 0x0 boots into `invalid
+header` at 0x2000. Layout: `0x2000 bootloader, 0x8000 partition table,
+0x10000 app` (same as `tools/flash.py`).
+
+## Signal chain
+
+The raw RSSI is shaped before it reaches any output (`rssi_pipeline.c`, a
+port of the FPVGateC5RX pipeline, CC BY-NC-SA 4.0):
+
+```text
+phy_get_rssi() @1 kHz
+  -> 30 ms peak-hold window     (hides the ~25 ms AGC refresh dips)
+  -> median-of-3                (drops single-sample glitches)
+  -> optional EMA low-pass      (E command; off by default)
+  -> optional soft knee         (K command; tames the saturating ceiling)
+  -> calibration: dbLo -> 0, dbHi -> 255   (C command; defaults -100/-40)
+```
+
+The calibrated `0..255` value is what the analog outputs and the bus report
+(`P` on USB). The raw dBm stays on the wire as `R` for diagnostics. With
+the default calibration the DAC output reproduces the original dBm mapping
+exactly.
+
 ## USB protocol
 
 Console is USB CDC (`CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y`). One line per
 sample at ~1 kHz (FreeRTOS 1 ms tick):
 
 ```
-R:-72 NF:-95 G:52 M:0
+R:-72 NF:-95 G:47 M:0 P:167
 ```
 
 | field | meaning |
 |---|---|
-| `R` | wideband RSSI in dBm (total in-channel power, signal + noise + adjacent) |
+| `R` | wideband RSSI in dBm, raw (total in-channel power, signal + noise + adjacent) |
 | `NF` | PHY noise-floor estimate in dBm, `-127` if invalid |
 | `G` | forced gain index (valid only when `M:0`), `-1` in native AGC mode |
 | `M` | `0` = firmware forced gain, `1` = native hardware AGC |
+| `P` | calibrated strength value 0..255 (the shaped signal the outputs use) |
 
 `-127` in `R` never reaches the wire (the line is suppressed); `-127` in
 `NF` means the noise-floor detector had no valid value.
@@ -66,24 +115,95 @@ R:-72 NF:-95 G:52 M:0
 
 The same D4..D9 resistor network as the video output
 (8.2k/3.9k/2k/1k/470R/240R + 200R), same pin/bit order, static GPIO writes
-(no GDMA at 1 kHz). RSSI dBm is mapped onto 0..63 and clamped:
+(no GDMA at 1 kHz). The calibrated 0..255 value is mapped onto 0..63:
 
-- `RSSI_DAC_DBM_LO = -100`, `RSSI_DAC_DBM_HI = -40` (tune after the bench
-  session; raw dBm is always on USB so the mapping can be adjusted from
-  recorded data).
+- Defaults: `dbLo = -100 dBm -> 0`, `dbHi = -40 dBm -> 255` (i.e. code
+  ≈ (dBm + 100) * 63 / 60, as before). Calibrate per site with `C lo hi`.
 - `V` inverts polarity at runtime.
+- `OUT n` fixes the level for wiring tests; `OUT off` restores the live
+  value.
+
+### Sigma-delta analog output (optional, off by default)
+
+A 4 MHz 1-bit switching output on one GPIO into an RC filter gives ~8-bit
+analog resolution, much finer than the 6-bit ladder. Configure
+`CONFIG_C5VRX_RSSI_SDM_PIN` (default -1 = off) and the divider ratio
+(`CONFIG_C5VRX_RSSI_SDM_DIVIDER_M1000`, default 500 = 10k/10k) to match
+your RC network. Wiring: `GPIO -[R1=10k]-[node]-[R2=10k]- GND` with a
+`100 nF` cap from the node to GND; the node is the RSSI pin.
+
+Do **not** put this on the auto-download arm pin (GPIO10) while that
+circuit is fitted: the 4 MHz switching keeps the MOSFET half-on and holds
+BOOT low, so the board can no longer boot from flash.
 
 ## Commands
 
 | key | action |
 |---|---|
 | `H` | help |
-| `T` | status line: `ST f:<mhz> mode:<forced\|native_agc> ...` |
+| `T` | status line: `ST f:<mhz> mode:... state:... cal:... ema:... win:... knee:...` plus bus stats |
 | `N` | toggle native hardware AGC, persist to NVS, reboot |
 | `S` | fixed-gain sweep G15/31/47/63/79/81 (forced mode only), prints `SWEEP G:<g> R:<rssi> NF:<nf>` per gain, restores the previous gain |
-| `F<mhz>` | retune to an arbitrary MHz in the C5 5 GHz window (5180–5885), e.g. `F5800` |
+| `F<mhz>` / `F R4` | retune (5180–5885 MHz or a named FPV channel); also sets the boot frequency that `P` persists |
+| `CH R4` | tune to a named channel (line command) |
+| `SCAN [ms]` | measure all 48 FPV channels (deduped, in-window only), print per-channel dB, report the strongest, restore the previous frequency. ~4 s at the 50 ms default dwell |
+| `C` / `C lo hi` / `C lo` / `C hi` | show / set calibration; `lo`/`hi` take the current smoothed reading |
+| `K db r` / `K off` | soft knee: squeeze readings above `db` dB with compression ratio `r` (e.g. `K -50 4`) |
+| `E alpha` | EMA smoothing, 0.01–1 (1 = off, default) |
+| `W ms` | peak-hold window in ms (0 = off, default 30) |
+| `OUT n` / `OUT off` | fix the analog output at 0..255 (wiring test) / restore |
+| `U` | RX5808 bus statistics (frames, writes, reads, last word) |
+| `P` | save settings (calibration, EMA, knee, window, boot frequency, polarity) to NVS |
+| `D` | restore default settings (in memory; `P` to keep) |
 | `V` | invert DAC polarity |
 | `L` | pause / resume the 1 kHz stream |
+| `B` | reboot the meter (recovers a wedged stream) |
+| `X` | arm the external auto-download circuit (if fitted), then restart; the chip comes up in download mode waiting for esptool. Without the circuit this is a plain reboot |
+
+Settings persist in NVS (`c5vrx/rssi_cfg`): calibration, EMA, knee, window,
+boot frequency, DAC polarity. `P` writes them, `D` resets the in-memory
+copy.
+
+## Auto-download circuit (flash without buttons, no host-reset dependency)
+
+Background: on the C5 DevKit the USB-Serial/JTAG connector carries two
+control lines the chip interprets at reset — one asserts reset, the other
+holds GPIO0 (BOOT, the "wait for firmware" strapping). esptool's automatic
+ROM entry (`--before usb_reset`) depends on the host driving those lines
+into the right state, and on some Macs the driver's line state is not
+deterministic: the chip sometimes comes up in the app, sometimes in
+download mode, and sometimes neither. A pure-software self-download does
+not work on the C5 (the GPIO output driver does not hold the strapping pad
+low across a reset — verified on hardware 2026-10-02).
+
+The circuit lets the running meter hold BOOT low across its own restart,
+then releases it before the flasher's finish reset:
+
+```text
+meter GPIO10 ──►|──┬──────── gate ──────── 2N7000 (N-MOSFET)
+                1N4148  │                                      │
+                (anode  ├── 10 µF cap (+)                      drain ──► GPIO0 (BOOT pin)
+                  to    │  (-) to GND                           source ──► GND
+                 GPIO10)└── 50 kΩ ──► GND        (optional: 1 MΩ gate→GND)
+```
+
+Parts: 1× 2N7000, 1× 10 µF electrolytic (mind polarity), 1× 1N4148, 1× 50 kΩ.
+
+Sequence (firmware `X` does all of it):
+
+1. GPIO10 high ~150 ms: charges the gate cap through the diode (MOSFET on,
+   pulling BOOT to GND — overriding the board's pull-up).
+2. GPIO10 low, `esp_restart()`: the chip resets while the MOSFET still holds
+   BOOT low → the ROM samples download mode and waits for the flasher.
+3. The cap discharges through 50 kΩ (≈1.5 s to MOSFET-off). esptool
+   connects (`--before no_reset`), flashes, and finishes with
+   `--after watchdog_reset` — several seconds later, MOSFET long off, BOOT
+   pull-up wins → the new app boots and streams.
+
+Resulting flash loop (tools/flash_rssi_meter.sh):
+send `X` → `esptool --before no_reset --after watchdog_reset write_flash`
+→ streaming. No buttons, no DTR/RTS, no host-mood dependency. The circuit
+is inert when not armed (MOSFET off, diode blocks backfeed into GPIO10).
 
 ## Bench test plan
 
@@ -121,6 +241,44 @@ tens-to-hundreds-of-ms timescale. 1 kHz is far more than a race car needs;
 if the timer wants less, decimate on its side. A `R - NF` difference above a
 fixed threshold is the "drone in range" signal.
 
+## Bench results (2026-10-02, 4 MB C5 DevKit, VTX 5800 MHz)
+
+Step 1 (liveness) — PASS:
+
+- 1 kHz sustained: 30,002 samples in 30 s, zero inter-sample gaps over 20 ms.
+- Frequency dependence: tuned to the VTX (5800) vs an empty channel (5750)
+  the median RSSI differs by ~34 dB; retuning back restores the signal. The
+  meter measures the tuned channel only.
+
+Step 2 (`S` sweep, forced mode) — RSSI is **post-gain**:
+
+- The reading follows the firmware gain setting (it does not stay flat
+  across G15..G81). Consequences:
+  - Native-AGC mode is useless as a meter: the hardware re-acquisition
+    parks the reading at the noise floor regardless of signal. The meter
+    default stays **forced gain**.
+  - The fixed operating gain is part of the calibration. At gain 52 (the
+    C5VRX default) this front end's noise floor equals the clamped
+    on-signal level (zero detection margin). At **gain 47** the signal
+    reads ~34 dB above the empty-channel floor (signal ≈ -61 dBm, floor
+    ≈ -95 dBm at the bench position) — that is the operating point
+    (`METER_DEFAULT_GAIN`), with near-range clipping as the intended
+    "close enough" behavior. Re-run `S` per site/VTX power.
+
+Step 3 (distance): not yet walked (bench position was fixed). The 34 dB
+on/off margin at gain 47 is the detection budget; a `R - floor` threshold
+of ~10 dB over the empty-channel reading is comfortable.
+
+Other findings:
+
+- The `NF` field (PHY noise floor) is frequently invalid (-127) in this
+  image; use the empty-channel RSSI as the floor reference instead.
+- The 6-bit DAC mapping (-100..-40 dBm → 0..63) is unchanged; analog pin
+  check with a multimeter is still open (the bench board's ladder).
+- The 4 MB-built image also runs on the 8 MB XIAO board (the size check
+  only fails when the chip is smaller than the image header), so one image
+  serves both boards.
+
 ## Caveats
 
 - Wideband RSSI is total in-channel power, not carrier-only — adjacent
@@ -132,10 +290,35 @@ fixed threshold is the "drone in range" signal.
 - This image produces no video and no IQ. Do not treat its measurements as
   evidence about the video pipeline.
 
-## Frequency control (planned)
+## RX5808 3-wire bus (timer drop-in mode)
 
-`rf_set_frequency_mhz()` (serial `F<mhz>` today) is the entry point for the
-planned SPI-controlled frequency: the timer MCU will call the same function
-over SPI instead of USB characters. It bootstraps on the nearest public
-Wi-Fi center and applies the `phy_set_freq()` delta, then re-asserts gain/BW
-ownership exactly like the proven FPV retune path.
+The meter can sit where a lap timer expects an RX5808 module
+(`CONFIG_C5VRX_RSSI_BUS`, default on; pins via Kconfig, defaults SEL=6,
+CLK=4, DATA=5 — like-for-like with FPVGate's XIAO-S3 wiring).
+
+Protocol (port of FPVGate's `rx5808_decode`, CC BY-NC-SA 4.0): SEL falling
+starts a 25-bit frame; bit 0 is the address (bits 1-4), bit 5 is R/W (1 =
+write), bits 6-24 are data. Reads return a 20-bit register value the meter
+drives onto DATA during the frame's data phase.
+
+| address | write | read |
+|---|---|---|
+| `0x1` SYNTH_RF | 20-bit synthesizer register → retune (`tf = (f - 479) / 2`, reg = `(tf / 32) << 7 \| tf % 32`; frequencies snap to the nearest FPV channel within 2 MHz) | register for the current frequency |
+| `0x2` POWER | all-ones powers the receiver down (timers do this between scans), anything else wakes it | 0 |
+| `0x0` STATE | any write: reset (re-assert gain, retune) | 0 |
+| `0x6` EXT_INFO | - | `0xC5` signature + signed dBm |
+| `0x7` EXT_STATUS | - | counts, valid, frequency-supported, state |
+
+The ISR runs on core 0; a 1 ms bus task processes queued frames so host
+tuning works even while the console blocks. The 1 kHz output task refreshes
+the readback registers; the ISR never touches the pipeline.
+
+## Frequency control
+
+`rf_set_frequency_mhz()` is the single retune entry point, reachable three
+ways today: USB (`F`/`CH`/`SCAN`), the RX5808 bus (SYNTH_RF writes), and
+internally at boot (`P`-persisted boot frequency). It bootstraps on the
+nearest public Wi-Fi center and applies the `phy_set_freq()` delta, then
+re-asserts gain/BW ownership exactly like the proven FPV retune path. A
+future SPI-controlled variant would call the same function instead of USB
+characters.

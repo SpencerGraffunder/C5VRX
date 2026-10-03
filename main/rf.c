@@ -786,6 +786,32 @@ size_t rf_get_channel_count(void)
     return FPV_BAND_COUNT * 8u;
 }
 
+const fpv_channel_t *rf_get_channel_at(size_t index)
+{
+    if (index >= FPV_BAND_COUNT * 8u) {
+        return NULL;
+    }
+    return &s_fpv_channels[index / 8u][index % 8u];
+}
+
+const fpv_channel_t *rf_find_channel_by_freq(uint16_t freq_mhz, int tol_mhz)
+{
+    const fpv_channel_t *best = NULL;
+    int best_diff = 0x7FFF;
+    for (int b = 0; b < FPV_BAND_COUNT; ++b) {
+        for (int i = 0; i < 8; ++i) {
+            const fpv_channel_t *ch = &s_fpv_channels[b][i];
+            int d = (int)ch->freq_mhz - (int)freq_mhz;
+            if (d < 0) d = -d;
+            if (d <= tol_mhz && d < best_diff) {
+                best = ch;
+                best_diff = d;
+            }
+        }
+    }
+    return best;
+}
+
 fpv_band_t rf_get_current_band(void)
 {
     return s_current_band;

@@ -12,6 +12,54 @@ config C5VRX_RSSI_METER
         dump writer cannot corrupt heap. Video is deliberately sacrificed;
         flash the normal firmware again for picture. See docs/rssi-meter.md.
 
+    if C5VRX_RSSI_METER
+        config C5VRX_RSSI_BUS
+            bool "RX5808 3-wire bus (timer drop-in compatibility)"
+            default y
+            help
+                Receive RX5808-style tuning frames on the SEL/CLK/DATA pins
+                (SEL falling starts a 25-bit frame; the host sends address +
+                R/W, writes send data, reads get a 20-bit register value
+                back). Register 0x1 writes retune, 0x2 all-ones powers the
+                receiver down, 0x0 writes reset it, and 0x6/0x7 expose the
+                RSSI digitally. See docs/rssi-meter.md.
+
+        config C5VRX_RSSI_BUS_SEL_PIN
+            int "RX5808 bus SEL pin"
+            default 6
+            depends on C5VRX_RSSI_BUS
+            range 0 28
+
+        config C5VRX_RSSI_BUS_CLK_PIN
+            int "RX5808 bus CLK pin"
+            default 4
+            depends on C5VRX_RSSI_BUS
+            range 0 28
+
+        config C5VRX_RSSI_BUS_DATA_PIN
+            int "RX5808 bus DATA pin (bidirectional)"
+            default 5
+            depends on C5VRX_RSSI_BUS
+            range 0 28
+
+        config C5VRX_RSSI_SDM_PIN
+            int "Sigma-delta RSSI output pin (-1 = off)"
+            default -1
+            range -1 28
+            help
+                Drives the 4 MHz sigma-delta output for an RC-filtered
+                analog RSSI pin (~8-bit resolution, see docs/rssi-meter.md
+                for the 10k/10k + 100nF wiring). Off by default: never put
+                this on the auto-download arm pin (GPIO10) unless that
+                circuit is not fitted, the 4 MHz switching would keep the
+                MOSFET half-on and hold the BOOT pin low.
+
+        config C5VRX_RSSI_SDM_DIVIDER_M1000
+            int "Sigma-delta output divider ratio (milli, 500 = 10k/10k)"
+            default 500
+            range 100 1000
+    endif
+
 menu "C5VRX diagnostic probes"
     config C5VRX_PHY_PHASE_TAP_PROBE
         bool "Capture bounded MODEM_DIAG lane traces at boot, then start video"

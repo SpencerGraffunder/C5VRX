@@ -143,6 +143,8 @@ typedef enum {
 const fpv_channel_t *rf_get_current_channel(void);
 size_t rf_get_channel_index(void);
 size_t rf_get_channel_count(void);
+const fpv_channel_t *rf_get_channel_at(size_t index); /* index = band*8+idx, or NULL */
+const fpv_channel_t *rf_find_channel_by_freq(uint16_t freq_mhz, int tol_mhz); /* nearest named FPV channel within tol_mhz, or NULL */
 esp_err_t rf_set_channel(size_t index);
 
 /**
