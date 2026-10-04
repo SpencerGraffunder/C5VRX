@@ -24,7 +24,8 @@ if(CONFIG_C5VRX_RSSI_METER)
         "arc_phy.c"
         "rssi_pipeline.c"
         "rx5808_bus.c"
-        "rssi_sdm.c")
+        "rssi_sdm.c"
+        "rh_node.c")
 endif()
 
 idf_component_register(

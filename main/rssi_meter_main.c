@@ -65,6 +65,10 @@
  *   D               restore default settings (in memory, not saved)
  *   V      invert DAC polarity
  *   L      pause / resume the 1 kHz stream
+ *   M      RotorHazard USB node mode (persist, reboot). In node mode the port
+ *          answers server polls only; M returns to the console. A protocol
+ *          command byte arriving on a console port switches to node mode
+ *          automatically.
  *   B      reboot the meter (clean esp_restart; recovers a wedged stream)
  *   X      arm the external auto-download circuit and restart. The circuit
  *          (see "Auto-download circuit" in docs/rssi-meter.md) is a
@@ -122,6 +126,7 @@
 #include "rssi_pipeline.h"
 #include "rssi_sdm.h"
 #include "rx5808_bus.h"
+#include "rh_node.h"
 
 /* The allocation selector disconnects BOTH 64 KiB dump banks from the CPU.
  * Same proven reservation as the capture-only meter; the background
@@ -149,6 +154,13 @@ extern char _bss_end;
  * the race-timer operating point. Re-calibrate with the S sweep per site. */
 #define METER_DEFAULT_GAIN   47u
 
+/* Node-mode defaults, used only until the server polls and writes its own
+ * per-node levels. On the 0..255 strength scale with the default -100..-40 dBm
+ * calibration, 120 is about -71 dBm and 100 about -76 dBm: above the measured
+ * quiet floor (~-90 dBm) and well below a close-range reading (~-45 dBm). */
+#define RH_NODE_ENTER_AT   120u
+#define RH_NODE_EXIT_AT    100u
+
 /* Six-bit video DAC. Same pin order as the video path (byte bit i -> pin i,
  * PARLIO LSB-first): never change the order, the physical
  * 8.2k/3.9k/2k/1k/470R/240R + 200R network is wired to exactly these pins. */
@@ -174,7 +186,7 @@ typedef enum {
 #define METER_CFG_MAGIC    0x4335524Du /* "C5RM" */
 /* Version 2 adds the signal-present stage (margin, hysteresis, floor, fresh,
  * baseline learning rate). An old blob is rejected and defaults are used. */
-#define METER_CFG_VERSION  2u
+#define METER_CFG_VERSION  3u
 typedef struct {
     uint32_t magic;
     uint16_t version;
@@ -193,6 +205,11 @@ typedef struct {
     float floor_db;
     float baseline_alpha;
     uint32_t fresh_ms;
+    /* RotorHazard USB node mode. When on, the port speaks the RotorHazard
+     * request/response protocol instead of the 1 kHz text stream, so nothing
+     * else may be written to it. M toggles it at runtime and persists here. */
+    uint8_t node_mode;
+    uint32_t min_lap_ms;
 } meter_cfg_t;
 
 static void meter_cfg_defaults(meter_cfg_t *cfg)
@@ -222,6 +239,12 @@ static void meter_cfg_defaults(meter_cfg_t *cfg)
     /* A reading unchanged for this long means no carrier: with the VTX off the
      * register held one value for 60 s, with it on the value moved constantly. */
     cfg->fresh_ms = 1000u;
+    /* Node mode is the default: RotorHazard polls the port and the meter
+     * answers as a node. Press M for the human console instead. */
+    cfg->node_mode = 1;
+    /* Guard against threshold bounce producing a second lap for the same
+     * pass (same value the proven NuclearCounter node uses). */
+    cfg->min_lap_ms = 3000u;
 }
 
 static bool meter_cfg_valid(const meter_cfg_t *cfg)
@@ -252,6 +275,9 @@ static bool meter_cfg_valid(const meter_cfg_t *cfg)
     }
     if (cfg->boot_mhz != 0u &&
         (cfg->boot_mhz < METER_FREQ_MIN_MHZ || cfg->boot_mhz > METER_FREQ_MAX_MHZ)) {
+        return false;
+    }
+    if (cfg->min_lap_ms > 60000u) {
         return false;
     }
     return true;
@@ -311,6 +337,17 @@ static volatile uint32_t s_bus_last_word;
 static volatile bool s_bus_last_sel;
 static volatile bool s_bus_last_clk;
 
+/* RotorHazard USB node state. The 1 kHz task feeds samples; the console task
+ * runs the protocol. Both touch the node, so it is mutex-protected. */
+static rh_node_t s_node;
+static SemaphoreHandle_t s_node_mutex;
+static volatile bool s_node_mode;
+static volatile bool s_quiet;   /* suppress console prints while node mode owns the port */
+
+static void node_feed(uint8_t counts, uint32_t now_ms);
+static void meter_arm_download_and_restart(void);
+static void meter_set_frequency(uint16_t mhz);
+
 static void dac_write(uint8_t code)
 {
     for (unsigned i = 0u; i < 6u; ++i) {
@@ -327,6 +364,18 @@ static uint8_t counts_to_code(uint8_t counts)
         code = 63u - code;
     }
     return code;
+}
+
+/* Feed one calibrated strength sample to the node engine. Called from the
+ * 1 kHz task; the console task reads the same state when building a reply. */
+static void node_feed(uint8_t counts, uint32_t now_ms)
+{
+    if (!s_node_mutex) {
+        return;
+    }
+    xSemaphoreTake(s_node_mutex, portMAX_DELAY);
+    rh_node_on_sample(&s_node, counts, now_ms);
+    xSemaphoreGive(s_node_mutex);
 }
 
 static void meter_output_task(void *arg)
@@ -356,17 +405,21 @@ static void meter_output_task(void *arg)
                                           : rssi_pipeline_counts(&s_pipe);
         dac_write(counts_to_code(p));
         rssi_sdm_set_counts(p);
+        node_feed(p, now_ms);
 
         /* Pass event: printed once per transition, so a timer or a log can
          * see "drone in range" without re-deriving a threshold from the
-         * stream. Rare, so it never disturbs the 1 kHz cadence. */
+         * stream. Rare, so it never disturbs the 1 kHz cadence. Suppressed in
+         * node mode: the port must carry only protocol replies. */
         bool sig = rssi_pipeline_signal_present(&s_pipe);
         if (sig != s_last_signal) {
             s_last_signal = sig;
-            printf("EVENT %s f=%u sig=%.1f dB base=%.1f\n",
-                   sig ? "present" : "clear", s_tuned_mhz,
-                   rssi_pipeline_signal_db(&s_pipe),
-                   rssi_pipeline_baseline_db(&s_pipe));
+            if (!s_node_mode) {
+                printf("EVENT %s f=%u sig=%.1f dB base=%.1f\n",
+                       sig ? "present" : "clear", s_tuned_mhz,
+                       rssi_pipeline_signal_db(&s_pipe),
+                       rssi_pipeline_baseline_db(&s_pipe));
+            }
         }
 
         /* Bus readback registers, refreshed every tick so the interrupt
@@ -381,7 +434,7 @@ static void meter_output_task(void *arg)
             p, rssi_pipeline_valid(&s_pipe), s_freq_supported, s_state,
             rssi_pipeline_signal_present(&s_pipe));
 
-        if (!s_stream_paused && rssi_ok) {
+        if (!s_stream_paused && rssi_ok && !s_node_mode) {
             bool native = rf_native_agc_active();
             printf("R:%d NF:%d G:%d M:%d P:%u S:%d\n",
                    rssi,
@@ -622,6 +675,7 @@ static void meter_help(void)
            " P   save settings to NVS | D defaults (not saved)\n"
            " V   invert DAC polarity\n"
            " L   pause/resume 1 kHz stream\n"
+           " M   RotorHazard USB node mode (persist, reboot)\n"
            " B   reboot the meter\n"
            " X   arm external auto-download circuit, then restart (for flashing)\n");
 }
@@ -666,6 +720,47 @@ static void meter_status(void)
            (unsigned)s_bus_reads, (unsigned long)s_bus_last_word,
            (unsigned)s_bus_last_read_addr);
 #endif
+    printf("NODE mode:%s enter:%d exit:%d minlap:%lu lap:%d current:%d peak:%d nadir:%d "
+           "laps:%lu reads:%lu errors:%lu\n",
+           s_node_mode ? "rotorhazard" : "console",
+           s_node.enter_at, s_node.exit_at,
+           (unsigned long)s_node.min_lap_ms, s_node.lap_id,
+           s_node.current, s_node.node_peak, s_node.node_nadir,
+           (unsigned long)s_node.laps_recorded,
+           (unsigned long)s_node.reads, (unsigned long)s_node.errors);
+}
+
+/* One received byte while node mode owns the port. The reply is written
+ * immediately: the server reads exactly payload + checksum bytes with a
+ * 250 ms timeout, so nothing else may be printed on this path. */
+static void node_handle_byte(uint8_t c)
+{
+    uint8_t out[24];
+    int len = 0;
+    uint16_t pending = 0;
+    bool fp = false, boot = false;
+
+    xSemaphoreTake(s_node_mutex, portMAX_DELAY);
+    len = rh_node_handle_byte(&s_node, c, out);
+    fp = s_node.freq_pending;
+    pending = s_node.pending_freq_mhz;
+    boot = s_node.bootloader_pending;
+    s_node.freq_pending = false;
+    s_node.bootloader_pending = false;
+    xSemaphoreGive(s_node_mutex);
+
+    if (len > 0) {
+        fwrite(out, 1, (size_t)len, stdout);
+        fflush(stdout);
+    }
+
+    /* Actions after the reply, so a retune never delays a checksum. */
+    if (fp) {
+        meter_set_frequency(pending);
+    }
+    if (boot) {
+        meter_arm_download_and_restart();
+    }
 }
 
 static void meter_gain_sweep(void)
@@ -766,9 +861,38 @@ static void meter_set_frequency(uint16_t mhz)
     uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
     esp_err_t err = meter_tune(mhz, now_ms);
     s_cfg.boot_mhz = mhz;
+    if (s_quiet) {
+        return;   /* node mode owns the port: no console output */
+    }
     const fpv_channel_t *ch = rf_find_channel_by_freq(s_tuned_mhz, 0);
     printf("F:%u err=%s%s (P saves as boot frequency)\n",
            mhz, esp_err_to_name(err), ch ? ch->name : "");
+}
+
+/* Arm the external auto-download circuit, then restart. GPIO10 charges the
+ * gate capacitor through a diode; the MOSFET holds GPIO0 (BOOT) low across
+ * the restart, so the ROM samples download mode and waits for esptool. The RC
+ * discharges in ~1.5 s, so esptool's watchdog finish (seconds later) boots the
+ * new app. Without the hardware this is a plain reboot. */
+static void meter_arm_download_and_restart(void)
+{
+    gpio_config_t arm_io = {
+        .pin_bit_mask = 1ULL << METER_DOWNLOAD_ARM_GPIO,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    if (gpio_config(&arm_io) == ESP_OK) {
+        gpio_set_level(METER_DOWNLOAD_ARM_GPIO, 1);
+        vTaskDelay(pdMS_TO_TICKS(150));
+        gpio_set_level(METER_DOWNLOAD_ARM_GPIO, 0);
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    printf("RSSI_METER download-armed: flash now with "
+           "--before no_reset --after watchdog_reset\n");
+    fflush(stdout);
+    esp_restart();
 }
 
 static void meter_scan(uint32_t dwell_ms)
@@ -940,6 +1064,18 @@ void app_main(void)
     };
     rssi_pipeline_begin(&s_pipe, &pcfg);
 
+    /* RotorHazard node engine. Defaults are overwritten by the server as soon
+     * as it polls (WRITE_FREQUENCY / ENTER / EXIT). */
+    s_node_mutex = xSemaphoreCreateMutex();
+    rh_node_begin(&s_node, s_cfg.boot_mhz ? s_cfg.boot_mhz : METER_BOOT_FREQ_MHZ,
+                  RH_NODE_ENTER_AT, RH_NODE_EXIT_AT, s_cfg.min_lap_ms);
+    s_node.fw_version = "C5VRX_RSSI_1.0";
+    s_node.fw_build_date = __DATE__;
+    s_node.fw_build_time = __TIME__;
+    s_node.fw_proctype = "ESP32C5";
+    s_node_mode = s_cfg.node_mode != 0;
+    s_quiet = s_node_mode;
+
     /* Optional sigma-delta analog output. */
     bool sdm_on = rssi_sdm_begin(CONFIG_C5VRX_RSSI_SDM_PIN,
                                  CONFIG_C5VRX_RSSI_SDM_DIVIDER_M1000);
@@ -985,10 +1121,11 @@ void app_main(void)
         return;
     }
 
-    printf("RSSI_METER READY f=%u mode=%s stream=1kHz dac=6bit cal=%.0f..%.0f dB "
+    printf("RSSI_METER READY f=%u mode=%s stream=%s dac=6bit cal=%.0f..%.0f dB "
            "win=%u ms%s%s\n",
            s_tuned_mhz,
            rf_native_agc_active() ? "native_agc" : "forced",
+           s_node_mode ? "rh_node" : "1kHz",
            s_pipe.cfg.db_lo, s_pipe.cfg.db_hi,
            (unsigned)s_pipe.cfg.window_max_ms,
            rssi_sdm_active() ? " sdm:on" : "",
@@ -1006,6 +1143,52 @@ void app_main(void)
         int c = getchar();
         if (c < 0) {
             vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+        if (s_node_mode) {
+            /* Escape hatches: bytes the RotorHazard protocol does not define,
+             * so a human can still get back out without reflashing. */
+            if (c == 'M' || c == 'm') {
+                s_node_mode = false;
+                s_quiet = false;
+                s_cfg.node_mode = 0;
+                meter_cfg_save(&s_cfg);
+                printf("NODE mode off, console back (1 kHz stream resumes).\n");
+                fflush(stdout);
+                continue;
+            }
+            if (c == 'T' || c == 't') {
+                /* One status line on a polled port can cost the server one
+                 * failed read; it retries and flushes, so this is safe to use
+                 * sparingly. */
+                meter_status();
+                continue;
+            }
+            node_handle_byte((uint8_t)c);
+            continue;
+        }
+        if (rh_node_is_command((uint8_t)c)) {
+            /* A RotorHazard server poll arrived on a console-mode port. Any
+             * text we print here is read as the reply, so print AFTER the
+             * reply: the server reads exactly payload + checksum, then the
+             * next poll flushes the leftover notice. */
+            node_handle_byte((uint8_t)c);
+            printf("NODE detected (byte 0x%02X): node mode on, console off. Press M to return.\n", c);
+            fflush(stdout);
+            s_node_mode = true;
+            s_quiet = true;
+            s_cfg.node_mode = 1;
+            meter_cfg_save(&s_cfg);
+            continue;
+        }
+        if (c == 'M' || c == 'm') {
+            s_node_mode = true;
+            s_quiet = true;
+            s_cfg.node_mode = 1;
+            meter_cfg_save(&s_cfg);
+            printf("NODE mode on (RotorHazard protocol, saved). The port now answers "
+                   "server polls only; press M to return to the console.\n");
+            fflush(stdout);
             continue;
         }
         if (c == 'H' || c == 'h') {
@@ -1037,29 +1220,7 @@ void app_main(void)
         } else if (c == 'U' || c == 'u') {
             meter_status();
         } else if (c == 'X' || c == 'x') {
-            /* Arm the external auto-download circuit, then restart. GPIO10
-             * charges the gate capacitor through a diode; the MOSFET holds
-             * GPIO0 (BOOT) low across the restart, so the ROM samples
-             * download mode and waits for esptool. The RC discharges in
-             * ~1.5 s, so esptool's watchdog finish (seconds later) boots
-             * the new app. Without the hardware this is a plain reboot. */
-            gpio_config_t arm_io = {
-                .pin_bit_mask = 1ULL << METER_DOWNLOAD_ARM_GPIO,
-                .mode = GPIO_MODE_OUTPUT,
-                .pull_up_en = GPIO_PULLUP_DISABLE,
-                .pull_down_en = GPIO_PULLDOWN_DISABLE,
-                .intr_type = GPIO_INTR_DISABLE,
-            };
-            if (gpio_config(&arm_io) == ESP_OK) {
-                gpio_set_level(METER_DOWNLOAD_ARM_GPIO, 1);
-                vTaskDelay(pdMS_TO_TICKS(150));
-                gpio_set_level(METER_DOWNLOAD_ARM_GPIO, 0);
-                vTaskDelay(pdMS_TO_TICKS(50));
-            }
-            printf("RSSI_METER download-armed: flash now with "
-                   "--before no_reset --after watchdog_reset\n");
-            fflush(stdout);
-            esp_restart();
+            meter_arm_download_and_restart();
         } else if (c == 'F' || c == 'f') {
             read_line(line, sizeof(line), -1);
             char *tok[2] = {NULL, NULL};

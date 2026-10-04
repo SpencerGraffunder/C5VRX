@@ -390,3 +390,44 @@ nearest public Wi-Fi center and applies the `phy_set_freq()` delta, then
 re-asserts gain/BW ownership exactly like the proven FPV retune path. A
 future SPI-controlled variant would call the same function instead of USB
 characters.
+
+## RotorHazard USB node mode
+
+The meter can act as a RotorHazard race-timer node on the same USB port, so the
+server sees it as a normal receiver module instead of a console.
+
+Implementation: `main/rh_node.c` / `main/rh_node.h`, driven from the meter's
+1 kHz sample cadence. Command bytes and response layouts follow RotorHazard's
+own `src/interface/RHInterface.py` and `src/interface/serial_node.py`; the
+crossing / peak / nadir / lap semantics mirror the proven NuclearCounter
+`TimingCore`.
+
+Protocol invariants (these are why the console stream must stop in node mode):
+
+- The port is strictly request/response: the server writes one command byte
+  (plus payload for writes) and reads exactly `payload + checksum` bytes with a
+  250 ms timeout. Checksum is the sum of the payload bytes only, not the
+  command byte. Any extra text printed on this path is read as part of the
+  reply and fails the checksum.
+- API level reported is 35, which puts the server on the
+  `READ_LAP_PASS_STATS` (8 bytes) + `READ_LAP_EXTREMUMS` (8 bytes) path.
+- RSSI on the wire is the RotorHazard 0..255 strength scale, not dBm. The
+  calibrated pipeline already produces that scale, so the node layer consumes
+  pipeline counts directly. The server rejects 0 and 255
+  (`Node.is_valid_rssi`), so reported values are clamped to 1..254.
+- An extremum enters history only when its run ends (direction flips), matching
+  the reference node: the server sees one peak per pass, not one per sample.
+- The lap timestamp is the peak moment, not the moment the pass ends, because
+  the server derives lap time from `ms since lap`.
+
+Serial keys: `M` toggles node mode (persisted in NVS). `M` is not a protocol
+byte, so it is the escape hatch from node mode without reflashing. `T` prints
+one status line (safe on a polled port: the server retries and flushes).
+
+Host unit test (48 checks, byte-for-byte against the server's expectations):
+
+```sh
+cc -I main tools/test_rh_node.c main/rh_node.c -lm -o /tmp/test_rh_node && /tmp/test_rh_node
+```
+
+Not yet hardware-verified: the node layer needs a flash, which needs a reset.
