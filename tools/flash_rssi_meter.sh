@@ -3,7 +3,10 @@
 #
 # Usage: tools/flash_rssi_meter.sh [port] [--no-build] [--manual]
 #   port:      default /dev/cu.usbmodem1101
-#   --no-build skip the rebuild, flash the existing build_rssi_meter/
+#   --no-build skip the rebuild, flash the existing build_rssi_meter_4mb/
+#              The image header must match the board flash size: an 8MB-stamped
+#              app on this 4MB devkit asserts in esp_flash_spi_init at boot and
+#              crash-loops, which also tears down the JTAG debug module.
 #   --manual   the board is ALREADY in download mode (button sequence done)
 #              - skip ROM entry entirely.
 #
@@ -36,9 +39,9 @@ done
 if [ "$NO_BUILD" -eq 0 ]; then
   echo ">> building meter image"
   bash -c ". ~/esp/esp-idf/export.sh > /dev/null 2>&1 && \
-    idf.py -B build_rssi_meter \
-      -D SDKCONFIG=sdkconfig.rssi-meter \
-      -D \"SDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.rssi-meter.defaults\" \
+    idf.py -B build_rssi_meter_4mb \
+      -D SDKCONFIG=sdkconfig.rssi-meter-4mb \
+      -D \"SDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.rssi-meter-4mb.defaults\" \
       build"
 fi
 
@@ -48,9 +51,9 @@ flash() {
     python -m esptool --chip esp32c5 --port $PORT --baud 460800 \
       --before $1 --after watchdog_reset write_flash \
       --flash-mode dio --flash-freq 80m \
-      0x2000 build_rssi_meter/bootloader/bootloader.bin \
-      0x8000 build_rssi_meter/partition_table/partition-table.bin \
-      0x10000 build_rssi_meter/c5vrx3.bin"
+      0x2000 build_rssi_meter_4mb/bootloader/bootloader.bin \
+      0x8000 build_rssi_meter_4mb/partition_table/partition-table.bin \
+      0x10000 build_rssi_meter_4mb/c5vrx3.bin"
 }
 
 if [ "$MANUAL" -eq 1 ]; then
