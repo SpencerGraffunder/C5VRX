@@ -18,3 +18,4 @@ build_ci/
 build_*/
 sdkconfig.rssi-meter
 release-rssi-meter/
+sdkconfig.rssi-meter-4mb
