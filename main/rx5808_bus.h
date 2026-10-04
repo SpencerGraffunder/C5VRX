@@ -23,7 +23,9 @@
  *   0x1  last frequency value written (FPVGate's verifyFrequency() check)
  *   0x6  C5RX extension: D0-7 signal strength in dBm (signed), D8-15 0xC5
  *   0x7  C5RX extension: D0-7 RSSI 0..255, D8 valid, D9 channel
- *        supported, D11-14 state, D15 always 1
+ *        supported, D10 signal present, D11-14 state, D15 always 1
+ *        (D10 is unused by the reference protocol, so a plain RX5808 host
+ *        ignores it; a C5RX host can read the pass flag digitally.)
  * Registers the host may write:
  *   0x0  any write = reset (restart the radio, retune to the last frequency)
  *   0x1  D0-15 = RX5808 synthesizer register encoding the target MHz
@@ -111,11 +113,13 @@ uint16_t rx5808_mhz_to_synth_reg(uint16_t mhz);
 /* Build the 20-bit read value for register addr (see header for layout). */
 static inline uint32_t rx5808_build_status_word(uint8_t rssi, bool valid,
                                                 bool freq_supported,
-                                                uint8_t state)
+                                                uint8_t state,
+                                                bool signal_present)
 {
     uint32_t w = rssi & 0xFFu;
     if (valid) w |= 1u << 8;
     if (freq_supported) w |= 1u << 9;
+    if (signal_present) w |= 1u << 10;
     w |= ((uint32_t)(state & 0xFu)) << 11;
     w |= 1u << 15;
     return w;

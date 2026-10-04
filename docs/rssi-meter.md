@@ -72,6 +72,15 @@ bootloader lives at **0x2000** (not 0x0): the ROM reads its header from
 header` at 0x2000. Layout: `0x2000 bootloader, 0x8000 partition table,
 0x10000 app` (same as `tools/flash.py`).
 
+Host unit tests (no board needed) cover the shaping and bus rules, including
+the floor guard, baseline learner, hysteresis, freshness, settle blanking, stall
+detection, frame completion and the synthesizer-register math:
+
+```sh
+cc -I main tools/test_rssi_meter.c main/rssi_pipeline.c main/rx5808_bus.c -lm \
+   -o /tmp/test_rssi_meter && /tmp/test_rssi_meter
+```
+
 ## Signal chain
 
 The raw RSSI is shaped before it reaches any output (`rssi_pipeline.c`, a
@@ -107,6 +116,7 @@ R:-72 NF:-95 G:47 M:0 P:167
 | `G` | forced gain index (valid only when `M:0`), `-1` in native AGC mode |
 | `M` | `0` = firmware forced gain, `1` = native hardware AGC |
 | `P` | calibrated strength value 0..255 (the shaped signal the outputs use) |
+| `S` | signal present: `1` when the smoothed reading is `margin` dB above the learned quiet baseline (see "Signal-present detection") |
 
 `-127` in `R` never reaches the wire (the line is suppressed); `-127` in
 `NF` means the noise-floor detector had no valid value.
@@ -136,6 +146,32 @@ Do **not** put this on the auto-download arm pin (GPIO10) while that
 circuit is fitted: the 4 MHz switching keeps the MOSFET half-on and holds
 BOOT low, so the board can no longer boot from flash.
 
+### Signal-present detection
+
+The vendor noise-floor read is **invalid in forced-gain mode on this board**
+(`NF:-127` on every sample), so the meter cannot use it to decide whether a
+transmitter is there. It learns its own quiet baseline instead:
+
+- `baseline` tracks the quiet level with a slow per-sample coefficient
+  (`baseline_alpha`, default 0.002 ≈ 500 ms time constant at 1 kHz). Only
+  readings that are not themselves a pass train it, so a drone in range cannot
+  lift the reference level.
+- Readings below `floor_db` (default -105 dBm) are physically impossible for a
+  40 MHz channel (kTB floor ≈ -98 dBm). They mean "the detector is not
+  measuring", not "very weak signal", and never train the baseline.
+- A reading that has not changed for `fresh_ms` (default 1000 ms) is not
+  trusted: with the VTX off the register held one value for 60 s, with it on it
+  changed constantly. Without this rule a stale high value left over from a
+  finished pass would hold a lap timer's threshold open forever.
+- `signal present` = smoothed ≥ baseline + margin (default 12 dB), clearing at
+  margin − hysteresis (default 6 dB). Transitions print one `EVENT present` /
+  `EVENT clear` line, and the flag is also exposed digitally on the RX5808 bus
+  status register at D10.
+
+Commands: `A` shows the signal state, `A <db>` sets the margin, `R` forgets the
+learned baseline and re-learns it (do this whenever the site or the VTX
+changes).
+
 ## Commands
 
 | key | action |
@@ -151,6 +187,8 @@ BOOT low, so the board can no longer boot from flash.
 | `K db r` / `K off` | soft knee: squeeze readings above `db` dB with compression ratio `r` (e.g. `K -50 4`) |
 | `E alpha` | EMA smoothing, 0.01–1 (1 = off, default) |
 | `W ms` | peak-hold window in ms (0 = off, default 30) |
+| `A` / `A <db>` | show / set the signal-present margin over the learned baseline (default 12 dB) |
+| `R` | forget the learned baseline and re-learn it from the next valid reading |
 | `OUT n` / `OUT off` | fix the analog output at 0..255 (wiring test) / restore |
 | `U` | RX5808 bus statistics (frames, writes, reads, last word) |
 | `P` | save settings (calibration, EMA, knee, window, boot frequency, polarity) to NVS |
@@ -278,6 +316,36 @@ Other findings:
 - The 4 MB-built image also runs on the 8 MB XIAO board (the size check
   only fails when the chip is smaller than the image header), so one image
   serves both boards.
+
+## Bench results (2026-10-03/04, 4 MB C5 DevKit, VTX 5800 MHz, gain 47)
+
+Run against the image that was on the board at the time (the pre-pipeline
+meter, no `P:` field), read-only plus safe commands — no flashing, since any
+flash needs a chip reset the user had to perform manually.
+
+1. **1 kHz cadence is stable** — 656 lines in 4 s, no gaps.
+2. **The reading is post-gain** (it follows the gain writes), so a held gain is
+   required for a usable monotonic response.
+3. **With a carrier the register updates continuously and discriminates
+   frequency**: 5800 MHz read ≈ -53, 5810 ≈ -53 then dropped, 5820+ fell to
+   garbage, 5865/5885 read ≈ -91 (the noise floor).
+4. **With no carrier the register is stale, not quiet**: it held one value for
+   60 s (59,996 samples, zero changes) and that value was -124 dBm, which is
+   below the physical floor of a 40 MHz channel. This is why the pipeline now
+   has the floor guard and the freshness rule.
+5. **Gain response with a carrier is not monotonic**: G15/31/47 all read -53,
+   G63 read -21, G79/81 read -37/-39. So the gain index cannot be used as a
+   linear dB staircase; hold one gain and calibrate the window per site.
+6. **Close-range saturation is real**: at gain 47 with the VTX near, the
+   reading pinned around -44..-53 regardless of frequency, i.e. no distance
+   granularity at close range — acceptable for "close enough" race timing, but
+   the knee exists for sites that need the top of the scale to stay readable.
+7. **`NF` is always -127 in forced-gain mode** on this board, which is what
+   made the learned-baseline approach necessary.
+
+The new pipeline behaviour (floor guard, learned baseline, freshness, hysteresis)
+is verified by the host unit tests, not yet on hardware: the board still runs
+the pre-pipeline image and reflashing needs a reset.
 
 ## Caveats
 

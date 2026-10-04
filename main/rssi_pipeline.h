@@ -20,6 +20,22 @@
  *
  * The pipeline also blanks its output for settleMs after a retune and flags
  * itself stalled when no sample arrives for stallMs.
+ *
+ * Signal-present detection (added after the 2026-10-03/04 bench):
+ *   - The vendor noise-floor read is invalid in forced-gain mode on this
+ *     board (it returns out of range every sample), so the meter cannot use
+ *     it to decide whether a transmitter is there. It learns its own quiet
+ *     baseline instead.
+ *   - With no carrier the RSSI register is not refreshed at all: it holds its
+ *     last value for tens of seconds, and that value can be below the
+ *     physical noise floor (a 40 MHz channel cannot read below about -98 dBm,
+ *     yet the register reported -124). A reading below floor_db therefore
+ *     means "the detector is not measuring", not "very weak signal".
+ *   - A reading that has not changed for fresh_ms also means the detector is
+ *     not measuring, because a real carrier makes the register move constantly
+ *     (bench: continuous changes at 1 kHz with the VTX on, zero changes in
+ *     60 s with it off). Without this rule a stale high value from a finished
+ *     pass would keep a lap timer reporting "drone in range" forever.
  */
 #ifndef RSSI_PIPELINE_H
 #define RSSI_PIPELINE_H
@@ -48,6 +64,22 @@ typedef struct {
     uint32_t settle_ms;
     /* No sample for this long marks the pipeline stalled (ms). */
     uint32_t stall_ms;
+    /* Readings below this dB are physically impossible for a 40 MHz channel
+     * (kTB floor is about -98 dBm), so they mean the detector is not
+     * measuring anything. They never train the baseline. */
+    float floor_db;
+    /* Learned quiet baseline (dBm). The vendor noise floor is unusable in
+     * forced-gain mode, so this is the meter's own reference level. It only
+     * learns from readings that are not themselves a pass, so a drone in
+     * range cannot lift it. */
+    float baseline_alpha;   /* per-sample learning coefficient, [0, 1] */
+    /* Signal present when the smoothed reading is this many dB above the
+     * baseline, and clears this many dB below that point (hysteresis). */
+    float margin_db;
+    float hysteresis_db;
+    /* A reading unchanged for this long counts as "no carrier", because the
+     * register only moves when the detector is actually measuring. */
+    uint32_t fresh_ms;
 } rssi_pipeline_cfg_t;
 
 /* Ring capacity = longest peak-hold window in ms of samples. At the meter's
@@ -72,6 +104,15 @@ typedef struct {
     uint32_t last_sample_ms;
     uint32_t blank_until_ms;
     bool have_sample;
+    /* Signal-present state. */
+    float baseline_db;
+    bool have_baseline;
+    bool no_carrier;        /* last sample was below floor_db */
+    bool fresh;             /* last sample differed from the one before it */
+    float last_raw_db;
+    bool have_last_raw;
+    bool signal_present;
+    uint32_t last_change_ms;
 } rssi_pipeline_t;
 
 void rssi_pipeline_begin(rssi_pipeline_t *p, const rssi_pipeline_cfg_t *cfg);
@@ -92,6 +133,16 @@ bool rssi_pipeline_stalled(const rssi_pipeline_t *p);
 void rssi_pipeline_set_calibration(rssi_pipeline_t *p, float db_lo, float db_hi);
 void rssi_pipeline_set_ema_alpha(rssi_pipeline_t *p, float alpha);
 void rssi_pipeline_set_knee(rssi_pipeline_t *p, float db, float ratio);
+void rssi_pipeline_set_margin(rssi_pipeline_t *p, float margin_db, float hysteresis_db);
+/* Forget the learned baseline and re-learn it from the next valid reading. */
+void rssi_pipeline_reset_baseline(rssi_pipeline_t *p);
+bool rssi_pipeline_signal_present(const rssi_pipeline_t *p);
+float rssi_pipeline_baseline_db(const rssi_pipeline_t *p);
+/* Smoothed reading minus baseline, in dB. */
+float rssi_pipeline_signal_db(const rssi_pipeline_t *p);
+/* True while the last reading differed from the one before it (within
+ * fresh_ms): the detector is actually measuring. */
+bool rssi_pipeline_fresh(const rssi_pipeline_t *p);
 
 #ifdef __cplusplus
 }

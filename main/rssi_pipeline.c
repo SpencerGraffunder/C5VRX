@@ -25,6 +25,13 @@ void rssi_pipeline_reset(rssi_pipeline_t *p)
     p->have_sample = false;
     p->last_sample_ms = 0; p->blank_until_ms = 0;
     p->win_head = 0; p->win_count = 0;
+    p->baseline_db = p->cfg.db_lo;
+    p->have_baseline = false;
+    p->no_carrier = false;
+    p->fresh = false;
+    p->have_last_raw = false; p->last_raw_db = 0.0f;
+    p->signal_present = false;
+    p->last_change_ms = 0;
 }
 
 void rssi_pipeline_begin(rssi_pipeline_t *p, const rssi_pipeline_cfg_t *cfg)
@@ -39,6 +46,15 @@ void rssi_pipeline_begin(rssi_pipeline_t *p, const rssi_pipeline_cfg_t *cfg)
     if (p->cfg.window_max_ms > RSSI_PIPELINE_WIN_CAP) {
         p->cfg.window_max_ms = RSSI_PIPELINE_WIN_CAP;
     }
+    /* Defaults for the signal-present stage when the caller left them unset
+     * (0 is not a meaningful value for any of these). */
+    if (p->cfg.margin_db <= 0.0f) p->cfg.margin_db = 12.0f;
+    if (p->cfg.hysteresis_db < 0.0f) p->cfg.hysteresis_db = 6.0f;
+    if (p->cfg.baseline_alpha <= 0.0f || p->cfg.baseline_alpha > 1.0f) {
+        p->cfg.baseline_alpha = 0.002f;   /* ~500 ms time constant at 1 kHz */
+    }
+    if (p->cfg.floor_db >= 0.0f) p->cfg.floor_db = -105.0f;
+    if (p->cfg.fresh_ms == 0u) p->cfg.fresh_ms = 1000u;
     rssi_pipeline_reset(p);
 }
 
@@ -113,6 +129,36 @@ void rssi_pipeline_on_sample(rssi_pipeline_t *p, float db, uint32_t now_ms)
     p->have_sample = true;
     p->stalled = false;
 
+    /* Freshness. The RSSI register is only refreshed when the detector is
+     * actually measuring energy: with the VTX off it held one value for 60 s
+     * (59,996 samples, zero changes), with the VTX on it changed constantly.
+     * So a value that repeats for fresh_ms is evidence there is no carrier,
+     * and must not be reported as "drone in range" - a stale high value from a
+     * finished pass would otherwise hold a lap timer's threshold open. */
+    if (!p->have_last_raw || db != p->last_raw_db) {
+        p->last_change_ms = now_ms;
+        p->have_last_raw = true;
+        p->last_raw_db = db;
+    }
+    p->fresh = (now_ms - p->last_change_ms) <= p->cfg.fresh_ms;
+    /* A reading below the physical channel floor means "not measuring", not
+     * "very weak signal" (the register reported -124, which is impossible for
+     * a 40 MHz channel whose kTB floor is about -98 dBm). */
+    p->no_carrier = (db < p->cfg.floor_db);
+
+    /* Learned baseline. The vendor noise-floor read is invalid in forced-gain
+     * mode on this board, so the meter learns its own quiet level. Only
+     * readings that are not themselves a pass train it, so a drone in range
+     * cannot lift the reference level. */
+    if (!p->no_carrier) {
+        if (!p->have_baseline) {
+            p->baseline_db = db;
+            p->have_baseline = true;
+        } else if (db < p->baseline_db + p->cfg.margin_db) {
+            p->baseline_db += p->cfg.baseline_alpha * (db - p->baseline_db);
+        }
+    }
+
     float held = window_max(p, db, now_ms);   /* hides the AGC-refresh dips */
     float filtered = held;
     if (p->cfg.use_median3) {
@@ -136,12 +182,24 @@ void rssi_pipeline_on_sample(rssi_pipeline_t *p, float db, uint32_t now_ms)
     uint8_t mapped = map_counts(p, p->ema_db);
 
     if (now_ms < p->blank_until_ms) {
-        /* Still settling: keep showing the last good value. */
+        /* Still settling: keep showing the last good value, and do not let a
+         * half-measured reading change the signal-present state. */
         p->counts = p->held_counts;
         p->valid = false;
-    } else {
-        p->counts = mapped;
-        p->valid = true;
+        return;
+    }
+
+    p->counts = mapped;
+    p->valid = true;
+
+    if (!p->have_baseline || p->no_carrier || !p->fresh) {
+        p->signal_present = false;
+    } else if (!p->signal_present) {
+        if (p->ema_db >= p->baseline_db + p->cfg.margin_db) {
+            p->signal_present = true;
+        }
+    } else if (p->ema_db <= p->baseline_db + p->cfg.margin_db - p->cfg.hysteresis_db) {
+        p->signal_present = false;
     }
 }
 
@@ -192,4 +250,38 @@ void rssi_pipeline_set_knee(rssi_pipeline_t *p, float db, float ratio)
 {
     p->cfg.knee_db = db;
     p->cfg.knee_ratio = ratio < 1.0f ? 1.0f : ratio;
+}
+
+void rssi_pipeline_set_margin(rssi_pipeline_t *p, float margin_db, float hysteresis_db)
+{
+    if (margin_db > 0.0f) p->cfg.margin_db = margin_db;
+    if (hysteresis_db >= 0.0f) p->cfg.hysteresis_db = hysteresis_db;
+}
+
+void rssi_pipeline_reset_baseline(rssi_pipeline_t *p)
+{
+    p->have_baseline = false;
+    p->have_last_raw = false;
+    p->signal_present = false;
+}
+
+bool rssi_pipeline_signal_present(const rssi_pipeline_t *p)
+{
+    return p->signal_present;
+}
+
+float rssi_pipeline_baseline_db(const rssi_pipeline_t *p)
+{
+    return p->baseline_db;
+}
+
+float rssi_pipeline_signal_db(const rssi_pipeline_t *p)
+{
+    if (!p->have_baseline) return 0.0f;
+    return p->ema_db - p->baseline_db;
+}
+
+bool rssi_pipeline_fresh(const rssi_pipeline_t *p)
+{
+    return p->fresh;
 }

@@ -172,7 +172,9 @@ typedef enum {
 
 /* Persisted settings (NVS c5vrx/rssi_cfg). */
 #define METER_CFG_MAGIC    0x4335524Du /* "C5RM" */
-#define METER_CFG_VERSION  1u
+/* Version 2 adds the signal-present stage (margin, hysteresis, floor, fresh,
+ * baseline learning rate). An old blob is rejected and defaults are used. */
+#define METER_CFG_VERSION  2u
 typedef struct {
     uint32_t magic;
     uint16_t version;
@@ -185,6 +187,12 @@ typedef struct {
     uint16_t window_max_ms;
     float knee_db;
     float knee_ratio;
+    /* Signal-present stage. */
+    float margin_db;
+    float hysteresis_db;
+    float floor_db;
+    float baseline_alpha;
+    uint32_t fresh_ms;
 } meter_cfg_t;
 
 static void meter_cfg_defaults(meter_cfg_t *cfg)
@@ -200,6 +208,20 @@ static void meter_cfg_defaults(meter_cfg_t *cfg)
     cfg->window_max_ms = 30;
     cfg->knee_db = -55.0f;
     cfg->knee_ratio = 1.0f; /* off */
+    /* Signal present = smoothed reading at least margin_db above the learned
+     * quiet baseline, clearing hysteresis_db below that point. The margin is
+     * the bench separation measured on the DevKit (signal ~-45, quiet floor
+     * ~-90 dBm at gain 47), reduced to 12 dB so a distant drone still trips
+     * it while noise does not. */
+    cfg->margin_db = 12.0f;
+    cfg->hysteresis_db = 6.0f;
+    /* Below this the reading is physically impossible for a 40 MHz channel
+     * (kTB floor ~ -98 dBm), so it means the detector is not measuring. */
+    cfg->floor_db = -105.0f;
+    cfg->baseline_alpha = 0.002f;   /* ~500 ms time constant at 1 kHz */
+    /* A reading unchanged for this long means no carrier: with the VTX off the
+     * register held one value for 60 s, with it on the value moved constantly. */
+    cfg->fresh_ms = 1000u;
 }
 
 static bool meter_cfg_valid(const meter_cfg_t *cfg)
@@ -219,6 +241,13 @@ static bool meter_cfg_valid(const meter_cfg_t *cfg)
         return false;
     }
     if (cfg->knee_ratio < 1.0f) {
+        return false;
+    }
+    if (cfg->margin_db <= 0.0f || cfg->margin_db > 60.0f ||
+        cfg->hysteresis_db < 0.0f || cfg->hysteresis_db > cfg->margin_db ||
+        cfg->floor_db < -140.0f || cfg->floor_db > -20.0f ||
+        cfg->baseline_alpha <= 0.0f || cfg->baseline_alpha > 1.0f ||
+        cfg->fresh_ms == 0u || cfg->fresh_ms > 10000u) {
         return false;
     }
     if (cfg->boot_mhz != 0u &&
@@ -260,6 +289,7 @@ static meter_cfg_t s_cfg;
 static rssi_pipeline_t s_pipe;
 static SemaphoreHandle_t s_rf_mutex; /* serializes tune / power transitions */
 static volatile bool s_stream_paused;
+static volatile bool s_last_signal;   /* last reported pass event */
 static volatile bool s_dac_invert;
 static volatile int s_meter_gain = 52; /* rf_start() forced-gain default */
 static volatile int s_force_counts = -1; /* OUT command wiring test */
@@ -327,6 +357,18 @@ static void meter_output_task(void *arg)
         dac_write(counts_to_code(p));
         rssi_sdm_set_counts(p);
 
+        /* Pass event: printed once per transition, so a timer or a log can
+         * see "drone in range" without re-deriving a threshold from the
+         * stream. Rare, so it never disturbs the 1 kHz cadence. */
+        bool sig = rssi_pipeline_signal_present(&s_pipe);
+        if (sig != s_last_signal) {
+            s_last_signal = sig;
+            printf("EVENT %s f=%u sig=%.1f dB base=%.1f\n",
+                   sig ? "present" : "clear", s_tuned_mhz,
+                   rssi_pipeline_signal_db(&s_pipe),
+                   rssi_pipeline_baseline_db(&s_pipe));
+        }
+
         /* Bus readback registers, refreshed every tick so the interrupt
          * handler never has to touch the pipeline. */
         s_bus_read_regs[RX5808_REG_SYNTH_RF] =
@@ -336,16 +378,18 @@ static void meter_output_task(void *arg)
         if (smoothed > 127) smoothed = 127;
         s_bus_read_regs[RX5808_REG_EXT_INFO] = rx5808_build_info_word(smoothed);
         s_bus_read_regs[RX5808_REG_EXT_STATUS] = rx5808_build_status_word(
-            p, rssi_pipeline_valid(&s_pipe), s_freq_supported, s_state);
+            p, rssi_pipeline_valid(&s_pipe), s_freq_supported, s_state,
+            rssi_pipeline_signal_present(&s_pipe));
 
         if (!s_stream_paused && rssi_ok) {
             bool native = rf_native_agc_active();
-            printf("R:%d NF:%d G:%d M:%d P:%u\n",
+            printf("R:%d NF:%d G:%d M:%d P:%u S:%d\n",
                    rssi,
                    nf_ok ? nf : -127,
                    native ? -1 : s_meter_gain,
                    native ? 1 : 0,
-                   (unsigned)p);
+                   (unsigned)p,
+                   sig ? 1 : 0);
         }
         vTaskDelay(pdMS_TO_TICKS(1)); /* ~1 kHz; FreeRTOS tick = 1 ms */
     }
@@ -543,7 +587,9 @@ static void bus_handle_word(uint32_t bits25)
 static void meter_bus_task(void *arg)
 {
     (void)arg;
-    portMUX_TYPE bus_mux;
+    /* A portMUX must be initialised; an uninitialised stack mux is undefined
+     * and can spin forever on a garbage owner value. */
+    static portMUX_TYPE bus_mux = portMUX_INITIALIZER_UNLOCKED;
     for (;;) {
         if (s_bus_pending_valid) {
             portENTER_CRITICAL(&bus_mux);
@@ -569,6 +615,8 @@ static void meter_help(void)
            " CH R4       tune to a named channel\n"
            " C [lo hi]   show / set calibration dB (or 'C lo' / 'C hi')\n"
            " K db r|off  soft knee | E alpha EMA | W ms peak-hold window\n"
+           " A [db]  signal-present margin over learned baseline (default 12)\n"
+           " R       forget the learned baseline and re-learn it\n"
            " OUT n|off   fix analog output 0..255 (wiring test)\n"
            " U   RX5808 bus statistics\n"
            " P   save settings to NVS | D defaults (not saved)\n"
@@ -595,7 +643,8 @@ static void meter_status(void)
 {
     const fpv_channel_t *ch = rf_find_channel_by_freq(s_tuned_mhz, 0);
     printf("ST f:%u%s mode:%s state:%s cal:%.0f..%.0f dB ema:%.2f win:%u ms "
-           "knee:%.0f/%.1f dac_pol:%s paused:%d gain:%d\n",
+           "knee:%.0f/%.1f sig:%d/%.0f dB base:%.1f fresh:%d dac_pol:%s "
+           "paused:%d gain:%d\n",
            s_tuned_mhz, ch ? ch->name : "",
            rf_native_agc_active() ? "native_agc" : "forced",
            state_name(s_state),
@@ -603,6 +652,10 @@ static void meter_status(void)
            s_pipe.cfg.ema_alpha,
            (unsigned)s_pipe.cfg.window_max_ms,
            s_pipe.cfg.knee_db, s_pipe.cfg.knee_ratio,
+           rssi_pipeline_signal_present(&s_pipe) ? 1 : 0,
+           s_pipe.cfg.margin_db,
+           rssi_pipeline_baseline_db(&s_pipe),
+           rssi_pipeline_fresh(&s_pipe) ? 1 : 0,
            s_dac_invert ? "inverted" : "normal",
            s_stream_paused ? 1 : 0,
            s_meter_gain);
@@ -809,6 +862,11 @@ static void meter_apply_cfg_to_pipeline(void)
     rssi_pipeline_set_knee(&s_pipe, s_cfg.knee_db, s_cfg.knee_ratio);
     s_pipe.cfg.use_median3 = s_cfg.use_median3 != 0;
     s_pipe.cfg.window_max_ms = s_cfg.window_max_ms;
+    s_pipe.cfg.margin_db = s_cfg.margin_db;
+    s_pipe.cfg.hysteresis_db = s_cfg.hysteresis_db;
+    s_pipe.cfg.floor_db = s_cfg.floor_db;
+    s_pipe.cfg.baseline_alpha = s_cfg.baseline_alpha;
+    s_pipe.cfg.fresh_ms = s_cfg.fresh_ms;
     s_dac_invert = s_cfg.dac_invert != 0;
 }
 
@@ -874,6 +932,11 @@ void app_main(void)
         .knee_ratio = s_cfg.knee_ratio,
         .settle_ms = 35,
         .stall_ms = 200,
+        .floor_db = s_cfg.floor_db,
+        .baseline_alpha = s_cfg.baseline_alpha,
+        .margin_db = s_cfg.margin_db,
+        .hysteresis_db = s_cfg.hysteresis_db,
+        .fresh_ms = s_cfg.fresh_ms,
     };
     rssi_pipeline_begin(&s_pipe, &pcfg);
 
@@ -1061,6 +1124,36 @@ void app_main(void)
             if (t != 1) {
                 printf("WUSAGE W <ms 0..200>\n");
             }
+        } else if (c == 'A' || c == 'a') {
+            read_line(line, sizeof(line), -1);
+            char *tok[2] = {NULL, NULL};
+            int t = tokenize(line, tok, 2);
+            if (t == 1) {
+                float m = strtof(tok[0], NULL);
+                if (m > 0.0f && m <= 60.0f) {
+                    rssi_pipeline_set_margin(&s_pipe, m, s_pipe.cfg.hysteresis_db);
+                    s_cfg.margin_db = s_pipe.cfg.margin_db;
+                    printf("MARGIN %.1f dB (P saves)\n", s_pipe.cfg.margin_db);
+                } else {
+                    printf("AUSAGE A <margin dB 1..60>\n");
+                }
+            } else {
+                printf("SIGNAL present=%d margin=%.1f hyst=%.1f base=%.1f "
+                       "sig=%.1f fresh=%d floor=%.0f\n",
+                       rssi_pipeline_signal_present(&s_pipe) ? 1 : 0,
+                       s_pipe.cfg.margin_db, s_pipe.cfg.hysteresis_db,
+                       rssi_pipeline_baseline_db(&s_pipe),
+                       rssi_pipeline_signal_db(&s_pipe),
+                       rssi_pipeline_fresh(&s_pipe) ? 1 : 0,
+                       s_pipe.cfg.floor_db);
+            }
+        } else if (c == 'R' || c == 'r') {
+            /* The learned baseline is the only quiet reference the meter has
+             * (the vendor noise-floor read is invalid in forced-gain mode), so
+             * re-learn it whenever the site or the VTX changes. */
+            rssi_pipeline_reset_baseline(&s_pipe);
+            s_last_signal = false;
+            printf("BASELINE reset (re-learning from the next valid reading)\n");
         } else if (c == 'P' || c == 'p') {
             bool ok = meter_cfg_save(&s_cfg);
             printf("SAVE %s (boot_mhz=%u)\n", ok ? "ok" : "FAILED", s_cfg.boot_mhz);
