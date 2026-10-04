@@ -122,6 +122,8 @@
 #include "freertos/task.h"
 #include "hal/gpio_ll.h"
 #include "nvs_flash.h"
+#include "soc/uart_pins.h"
+#include "driver/uart.h"
 #include "rf.h"
 #include "rssi_pipeline.h"
 #include "rssi_sdm.h"
@@ -165,6 +167,11 @@ extern char _bss_end;
  * PARLIO LSB-first): never change the order, the physical
  * 8.2k/3.9k/2k/1k/470R/240R + 200R network is wired to exactly these pins. */
 static const gpio_num_t s_dac_gpio[6] = {23, 24, 11, 12, 8, 9};
+
+/* Pins the meter is actually allowed to drive. A ladder pin that is also the
+ * console UART pin is excluded (see the guard in app_main), otherwise the
+ * meter fights the serial link that is talking to it. */
+static bool s_dac_active[6];
 
 /* RX5808 bus pins (Kconfig; defaults match FPVGate's XIAO-S3 wiring so the
  * C5 side is like-for-like). */
@@ -285,6 +292,11 @@ static bool meter_cfg_valid(const meter_cfg_t *cfg)
 
 static void meter_cfg_load(meter_cfg_t *cfg)
 {
+    /* Defaults must be applied here, not by the caller: an absent or invalid
+     * NVS blob returns early, and a zeroed global would otherwise reach the
+     * pipeline as cal 0..0 dB / window 0 ms (the meter ran like that until
+     * this was fixed). */
+    meter_cfg_defaults(cfg);
     nvs_handle_t h;
     if (nvs_open("c5vrx", NVS_READONLY, &h) != ESP_OK) {
         return; /* keep defaults */
@@ -350,9 +362,14 @@ static void meter_set_frequency(uint16_t mhz);
 
 static void dac_write(uint8_t code)
 {
+#ifdef CONFIG_C5VRX_RSSI_DAC_ENABLE
     for (unsigned i = 0u; i < 6u; ++i) {
+        if (!s_dac_active[i]) {
+            continue;
+        }
         gpio_set_level(s_dac_gpio[i], (code >> i) & 1u);
     }
+#endif
 }
 
 /* Calibrated 0..255 strength -> 6-bit DAC code (0..63). With the default
@@ -790,6 +807,63 @@ static void meter_gain_sweep(void)
     printf("SWEEP done restored G:%d\n", restore);
 }
 
+/* Console RX through the UART driver, not the ROM "basic" console path.
+ *
+ * Root cause (bench, 2026-10-04): on this C5 devkit the app-level ROM console
+ * read never returns data - the meter could print but never hear. The physical
+ * RX path is healthy (esptool reaches the ROM download mode over the same
+ * wires), so only the ROM getchar() implementation is unusable from an app.
+ * Installing the UART0 driver makes RX go through the hardware RX FIFO, which
+ * works. Keep this: without it the meter can talk but cannot listen, and every
+ * serial command (including X, the no-button download-mode arm) is dead.
+ *
+ * The driver must be installed on the same pins the ROM console uses
+ * (U0RXD_GPIO_NUM / U0TXD_GPIO_NUM); meter_getchar() is the only reader, so the
+ * VFS console and the driver never compete for the same byte.
+ */
+static bool s_uart_rx_ready = false;
+
+static void meter_console_rx_init(void)
+{
+    const int rx = U0RXD_GPIO_NUM, tx = U0TXD_GPIO_NUM;
+    if (rx < 0 || tx < 0) {
+        printf("RSSI_METER console RX: no default UART pins, using ROM path\n");
+        return;
+    }
+    if (uart_is_driver_installed(UART_NUM_0)) {
+        s_uart_rx_ready = true;
+        return;
+    }
+    const uart_config_t cfg = {
+        .baud_rate = 115200,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .rx_flow_ctrl_thresh = 0,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+    esp_err_t err = uart_param_config(UART_NUM_0, &cfg);
+    if (err == ESP_OK) err = uart_set_pin(UART_NUM_0, tx, rx, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    if (err == ESP_OK) err = uart_driver_install(UART_NUM_0, 1024, 0, 0, NULL, 0);
+    if (err != ESP_OK) {
+        printf("RSSI_METER console RX: driver failed (%s), using ROM path\n", esp_err_to_name(err));
+        return;
+    }
+    s_uart_rx_ready = true;
+    printf("RSSI_METER console RX: UART0 driver rx=GPIO%d tx=GPIO%d\n", rx, tx);
+}
+
+static int meter_getchar(void)
+{
+    if (s_uart_rx_ready) {
+        uint8_t c;
+        if (uart_read_bytes(UART_NUM_0, &c, 1, 0) == 1) return c;
+        return -1;
+    }
+    return getchar();
+}
+
 /* Read the rest of the current line (to newline/EOS) into buf. A
  * previously-read first character may be passed in (the generic fallback
  * path); pass -1 when the command character was already consumed by the
@@ -797,12 +871,12 @@ static void meter_gain_sweep(void)
 static int read_line(char *buf, int len, int first_char)
 {
     int n = 0;
-    int c = (first_char >= 0) ? first_char : getchar();
+    int c = (first_char >= 0) ? first_char : meter_getchar();
     while (c >= 0 && c != '\n' && c != '\r') {
         if (n < len - 1) {
             buf[n++] = (char)c;
         }
-        c = getchar();
+        c = meter_getchar();
     }
     buf[n] = '\0';
     return n;
@@ -1028,7 +1102,16 @@ void app_main(void)
     meter_cfg_load(&s_cfg);
     s_dac_invert = s_cfg.dac_invert != 0;
 
-    /* Static DAC pins: outputs, code 0 until the first sample. */
+    /* Static DAC pins: outputs, code 0 until the first sample.
+     *
+     * Console conflict guard: on the ESP32-C5 the console UART default pins
+     * are GPIO 12 (RX) and GPIO 11 (TX) (soc/esp32c5/include/soc/uart_pins.h),
+     * which are DAC bits 3 and 2. Driving them as outputs destroys the serial
+     * link in both directions - the meter could not be talked to over the UART
+     * cable before this guard existed - so the meter must never own a pin the
+     * console is using. The physical ladder network is still wired to the full
+     * tested pin order; only the pins the console owns are left alone.
+     */
     gpio_config_t dac_cfg = {
         .pin_bit_mask = 0ULL,
         .mode = GPIO_MODE_OUTPUT,
@@ -1037,13 +1120,33 @@ void app_main(void)
         .intr_type = GPIO_INTR_DISABLE,
     };
     for (unsigned i = 0u; i < 6u; ++i) {
-        dac_cfg.pin_bit_mask |= 1ULL << (uint32_t)s_dac_gpio[i];
-        gpio_set_level(s_dac_gpio[i], 0);
+#ifdef CONFIG_C5VRX_RSSI_DAC_ENABLE
+        s_dac_active[i] = true;
+#else
+        s_dac_active[i] = false;
+#endif
+#ifdef CONFIG_ESP_CONSOLE_UART
+        if ((int)s_dac_gpio[i] == U0RXD_GPIO_NUM || (int)s_dac_gpio[i] == U0TXD_GPIO_NUM) {
+            s_dac_active[i] = false;
+        }
+#endif
+        if (s_dac_active[i]) {
+            dac_cfg.pin_bit_mask |= 1ULL << (uint32_t)s_dac_gpio[i];
+            gpio_set_level(s_dac_gpio[i], 0);
+        }
     }
-    if ((err = gpio_config(&dac_cfg)) != ESP_OK) {
+    if (dac_cfg.pin_bit_mask != 0ULL && (err = gpio_config(&dac_cfg)) != ESP_OK) {
         printf("RSSI_METER ERROR dac_gpio=%s\n", esp_err_to_name(err));
         return;
     }
+#ifndef CONFIG_C5VRX_RSSI_DAC_ENABLE
+    printf("RSSI_METER dac output disabled (ladder not fitted)\n");
+#elif defined(CONFIG_ESP_CONSOLE_UART)
+    if (!s_dac_active[2] || !s_dac_active[3]) {
+        printf("RSSI_METER dac partial: ladder pins %d/%d are the console UART and stay with the console\n",
+               U0RXD_GPIO_NUM, U0TXD_GPIO_NUM);
+    }
+#endif
 
     /* Pipeline (calibrated shaping of the raw RSSI). */
     rssi_pipeline_cfg_t pcfg = {
@@ -1135,12 +1238,13 @@ void app_main(void)
            ""
 #endif
     );
+    meter_console_rx_init();
     meter_help();
     fflush(stdout);
 
     char line[64];
     for (;;) {
-        int c = getchar();
+        int c = meter_getchar();
         if (c < 0) {
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;

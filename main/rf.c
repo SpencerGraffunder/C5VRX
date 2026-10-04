@@ -501,8 +501,22 @@ esp_err_t rf_start(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    /* Route MODEM_DIAG to PARLIO RX GPIO pins. */
+    /* Route MODEM_DIAG to PARLIO RX GPIO pins.
+     *
+     * The RSSI meter build must NOT do this. GPIO10 is simultaneously an IQ lane
+     * pin and the auto-download arm pin for the external BOOT circuit
+     * (diode + capacitor + 50k + MOSFET). Connecting a MODEM_DIAG output to it
+     * lets an RF diagnostic signal drive the MOSFET gate, so BOOT is held low
+     * across a reset and the board falls into download mode instead of booting
+     * the app - the "keeps needing a reset" failure. The meter has no PARLIO RX
+     * path, so this routing is unnecessary there; the arm GPIO stays under the
+     * meter's own control.
+     */
+#ifndef CONFIG_C5VRX_RSSI_METER
     if ((err = route_modem_iq()) != ESP_OK) return err;
+#else
+    (void)route_modem_iq;
+#endif
 
     /* Un-gate modem ADC clock and force continuous sampling. */
     rf_enable_continuous_modem();

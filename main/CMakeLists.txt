@@ -52,6 +52,7 @@ idf_component_register(
         esp_hal_gpio
         esp_driver_gptimer
         esp_driver_sdm
+        esp_driver_uart
 )
 
 # Proven default plus opt-in experimental demod/output paths. The meter
