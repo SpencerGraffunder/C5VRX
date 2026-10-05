@@ -56,7 +56,13 @@ c_names = [f.name for f in c_files]
 video_c = read(MAIN / "video.c")
 menu_lifecycle = video_c.split("static void video_set_menu_mode", 1)[1].split("static void menu_cycle_standard_mode", 1)[0]
 
-check("production receiver and dedicated menu/auto-lab modules", set(c_names) == {"main.c", "bs_relative_worker_probe.c", "bs_relative_middle_probe.c", "bs_addctia_probe.c", "phy_phase_tap_probe.c", "arc_phy.c", "arc_v3_controller.c", "arc_v5_autotune.c", "rx_auto_lab.c", "rf.c", "video.c", "direct_gain.c", "direct_gain_v2.c", "direct_gain_v3.c", "analog_video_detect.c", "menu_raster.c"},
+# This fork adds the standalone RSSI meter image, so its modules are part of
+# the expected main/ set here. They are compiled only when CONFIG_C5VRX_RSSI_METER
+# is on (see main/CMakeLists.txt); the normal video image still builds the
+# upstream set unchanged.
+check("production receiver, dedicated menu/auto-lab modules and the RSSI meter modules",
+      set(c_names) == {"main.c", "bs_relative_worker_probe.c", "bs_relative_middle_probe.c", "bs_addctia_probe.c", "phy_phase_tap_probe.c", "arc_phy.c", "arc_v3_controller.c", "arc_v5_autotune.c", "rx_auto_lab.c", "rf.c", "video.c", "direct_gain.c", "direct_gain_v2.c", "direct_gain_v3.c", "analog_video_detect.c", "menu_raster.c",
+                       "rssi_meter_main.c", "rssi_pipeline.c", "rx5808_bus.c", "rssi_sdm.c", "rh_node.c"},
       f"found: {c_names}")
 check("main.c present", "main.c" in c_names)
 check("rf.c present", "rf.c" in c_names)
