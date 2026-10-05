@@ -1,0 +1,11 @@
+name: CI Trigger Probe
+
+on:
+  push:
+    branches: [main, "feat/**"]
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "trigger probe ok"
