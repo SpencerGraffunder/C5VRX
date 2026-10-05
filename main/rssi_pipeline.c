@@ -8,6 +8,11 @@
 
 #include <math.h>
 
+/* Falling readings are the quiet level revealing itself, so they are followed
+ * quickly (~20 ms time constant at 1 kHz). Rising readings that are still
+ * below the pass margin move the reference only at cfg.baseline_alpha. */
+#define RSSI_BASELINE_FAST_ALPHA 0.05f
+
 static float med3(float a, float b, float c)
 {
     float mx = a > b ? a : b;
@@ -149,11 +154,19 @@ void rssi_pipeline_on_sample(rssi_pipeline_t *p, float db, uint32_t now_ms)
     /* Learned baseline. The vendor noise-floor read is invalid in forced-gain
      * mode on this board, so the meter learns its own quiet level. Only
      * readings that are not themselves a pass train it, so a drone in range
-     * cannot lift the reference level. */
+     * cannot lift the reference level.
+     *
+     * A pass can never lift the reference, but a reference seeded by a pass is
+     * recoverable: a meter that boots with the VTX already transmitting seeds
+     * high, and the first quiet reading pulls it down fast. Without that fast
+     * fall the meter would keep the pass level as its quiet reference forever
+     * and never report signal present. */
     if (!p->no_carrier) {
         if (!p->have_baseline) {
             p->baseline_db = db;
             p->have_baseline = true;
+        } else if (db < p->baseline_db) {
+            p->baseline_db += RSSI_BASELINE_FAST_ALPHA * (db - p->baseline_db);
         } else if (db < p->baseline_db + p->cfg.margin_db) {
             p->baseline_db += p->cfg.baseline_alpha * (db - p->baseline_db);
         }
@@ -233,10 +246,16 @@ bool rssi_pipeline_stalled(const rssi_pipeline_t *p)
 
 void rssi_pipeline_set_calibration(rssi_pipeline_t *p, float db_lo, float db_hi)
 {
-    if (db_hi > db_lo) {
-        p->cfg.db_lo = db_lo;
-        p->cfg.db_hi = db_hi;
+    /* Physical bounds: a receiver never reports 0 dBm, and a window narrower
+     * than 5 dB makes the 0..255 output meaningless. A caller that passes a
+     * nonsense window leaves the working calibration in place. */
+    if (db_lo < -140.0f || db_lo > -10.0f ||
+        db_hi < -100.0f || db_hi > 10.0f ||
+        db_hi <= db_lo + 5.0f) {
+        return;
     }
+    p->cfg.db_lo = db_lo;
+    p->cfg.db_hi = db_hi;
 }
 
 void rssi_pipeline_set_ema_alpha(rssi_pipeline_t *p, float alpha)

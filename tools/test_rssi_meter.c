@@ -89,6 +89,30 @@ static void test_calibration(void)
                rssi_pipeline_baseline_db(&p), -100.0f, 0.01f);
 }
 
+/* A mistyped console line once wrote a 0..120 dBm window into a live meter
+ * because strtof("AN") is 0.0 and the only rule was hi > lo. The window must
+ * stay physically possible. */
+static void test_calibration_bounds(void)
+{
+    rssi_pipeline_t p;
+    rssi_pipeline_cfg_t c = base_cfg();
+    rssi_pipeline_begin(&p, &c);
+
+    rssi_pipeline_set_calibration(&p, 0.0f, 120.0f);
+    check_near("nonsense window refused (lo)", p.cfg.db_lo, -100.0f, 0.01f);
+    check_near("nonsense window refused (hi)", p.cfg.db_hi, -40.0f, 0.01f);
+
+    rssi_pipeline_set_calibration(&p, -60.0f, -58.0f);
+    check("window narrower than 5 dB refused", p.cfg.db_lo == -100.0f && p.cfg.db_hi == -40.0f);
+
+    rssi_pipeline_set_calibration(&p, -110.0f, -50.0f);
+    check("valid window accepted", p.cfg.db_lo == -110.0f && p.cfg.db_hi == -50.0f);
+
+    /* lo must sit in the receiver's real reporting range. */
+    rssi_pipeline_set_calibration(&p, -150.0f, -60.0f);
+    check("lo below -140 dB refused", p.cfg.db_lo == -110.0f);
+}
+
 static void test_peak_hold_and_median(void)
 {
     rssi_pipeline_t p;
@@ -188,6 +212,32 @@ static void test_signal_present(void)
         rssi_pipeline_on_sample(&p, (t & 1u) ? -88.0f : -89.0f, t);   /* below margin - hyst */
     }
     check("clears below the hysteresis point", !rssi_pipeline_signal_present(&p));
+}
+
+/* The normal race-timer situation: the VTX is already transmitting when the
+ * meter boots, so the first reading is a pass level, not the quiet level. The
+ * reference must fall to the real noise floor as soon as a quiet reading
+ * appears, otherwise signal-present never fires. */
+static void test_baseline_recovers_from_hot_seed(void)
+{
+    rssi_pipeline_t p;
+    rssi_pipeline_cfg_t c = base_cfg();
+    rssi_pipeline_begin(&p, &c);
+
+    rssi_pipeline_on_sample(&p, -61.0f, 100);   /* boots with a pass in range */
+    check_near("hot seed starts at the pass level", rssi_pipeline_baseline_db(&p), -61.0f, 0.5f);
+
+    for (uint32_t t = 101; t < 201; ++t) {
+        rssi_pipeline_on_sample(&p, (t & 1u) ? -90.0f : -91.0f, t);
+    }
+    check_near("quiet readings pull the reference down fast",
+               rssi_pipeline_baseline_db(&p), -90.5f, 1.5f);
+
+    /* Now a real pass must be seen against the recovered quiet level. */
+    for (uint32_t t = 201; t < 301; ++t) {
+        rssi_pipeline_on_sample(&p, (t & 1u) ? -61.0f : -62.0f, t);
+    }
+    check("pass is detected after recovery", rssi_pipeline_signal_present(&p));
 }
 
 static void test_stale_value(void)
@@ -328,10 +378,12 @@ static void test_bus(void)
 int main(void)
 {
     test_calibration();
+    test_calibration_bounds();
     test_peak_hold_and_median();
     test_knee();
     test_settle_and_stall();
     test_signal_present();
+    test_baseline_recovers_from_hot_seed();
     test_stale_value();
     test_bus();
     printf("\n%d checks, %d failures\n", checks, failures);

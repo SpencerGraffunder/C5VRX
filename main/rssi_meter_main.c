@@ -472,6 +472,14 @@ static int meter_printf(const char *fmt, ...)
     return n;
 }
 
+/* Receive-liveness watchdog state (see meter_output_task). */
+#define RX_STALE_WARN_MS 5000u
+static volatile int s_rxwatch_raw = -128;
+static volatile uint32_t s_rxwatch_change_ms;
+static volatile uint32_t s_rxwatch_warn_ms;
+static volatile uint32_t s_rxwatch_nf_bad;
+static volatile uint32_t s_rxwatch_total;
+
 static void meter_output_task(void *arg)
 {
     for (;;) {
@@ -489,6 +497,33 @@ static void meter_output_task(void *arg)
             }
         }
         rssi_pipeline_tick(&s_pipe, now_ms);
+
+        /* Receive-liveness watchdog.
+         *
+         * This meter can print a perfect 1 kHz stream while the PHY detector
+         * is dead: measured on device, the raw RSSI sat on one value for the
+         * whole window, the noise floor read invalid, and a promiscuous-mode
+         * frame count stayed at zero even when tuned onto a nearby 802.11ax
+         * access point reporting -49 dBm. A lap timer fed by a frozen RSSI
+         * would fire on every lap or none, so the meter refuses to hide that
+         * state behind a plausible-looking number. */
+        if (rssi_ok && rssi != s_rxwatch_raw) {
+            s_rxwatch_raw = rssi;
+            s_rxwatch_change_ms = now_ms;
+        }
+        s_rxwatch_total++;
+        if (!nf_ok) s_rxwatch_nf_bad++;
+        uint32_t frozen_ms = now_ms - s_rxwatch_change_ms;
+        if (!s_node_mode && !s_stream_paused && s_powered &&
+            frozen_ms > RX_STALE_WARN_MS &&
+            now_ms - s_rxwatch_warn_ms > RX_STALE_WARN_MS) {
+            s_rxwatch_warn_ms = now_ms;
+            meter_printf("! RX STALE raw RSSI held at %d dBm for %u ms "
+                   "(noise floor invalid %u/%u) - the PHY detector is not "
+                   "updating, so these readings are not measurements\n",
+                   s_rxwatch_raw, (unsigned)frozen_ms,
+                   (unsigned)s_rxwatch_nf_bad, (unsigned)s_rxwatch_total);
+        }
 
         /* TUNING -> TRACKING once the pipeline has a post-settle reading. */
         if (s_state == METER_STATE_TUNING && rssi_pipeline_valid(&s_pipe)) {
@@ -758,14 +793,16 @@ static void meter_help(void)
            " N   toggle native HW AGC (persist, reboot)\n"
            " S   fixed-gain sweep G15..G81 (forced mode only, pre/post-gain oracle)\n"
            " F<mhz>|F R4  retune, 5180-5885, or a named FPV channel\n"
-           " SCAN [ms]   measure all 48 FPV channels, report strongest\n"
-           " CH R4       tune to a named channel\n"
+           " SCAN [ms]  walk every FPV channel, report the strongest (50 ms dwell)\n"
+           "            (one optional argument only: dwell in ms, 100..2000)\n"
+           " CH R4       tune to a named FPV channel\n"
            " C [lo hi]   show / set calibration dB (or 'C lo' / 'C hi')\n"
            " K db r|off  soft knee | E alpha EMA | W ms peak-hold window\n"
            " A [db]  signal-present margin over learned baseline (default 12)\n"
            " R       forget the learned baseline and re-learn it\n"
            " OUT n|off   fix analog output 0..255 (wiring test)\n"
            " U   RX5808 bus statistics\n"
+           " Z [sec]  diagnostics: Wi-Fi frames seen, RSSI distinct values\n"
            " P   save settings to NVS | D defaults (not saved)\n"
            " V   invert DAC polarity\n"
            " L   pause/resume 1 kHz stream\n"
@@ -812,6 +849,8 @@ static void meter_status(void)
            s_usbjtag_rx_ready ? "ready" : "none",
            s_out_port == MPORT_UART ? "uart" :
            (s_out_port == MPORT_USBJTAG ? "usbjtag" : "primary"));
+    meter_printf("RX raw:%d nf_invalid:%u/%u\n",
+           s_rxwatch_raw, (unsigned)s_rxwatch_nf_bad, (unsigned)s_rxwatch_total);
 #ifdef CONFIG_C5VRX_RSSI_BUS
     meter_printf("BUS sel:%d clk:%d data:%d frames:%lu writes:%lu reads:%u last:0x%05lX read@0x%X\n",
            (int)METER_BUS_SEL_PIN, (int)METER_BUS_CLK_PIN, (int)METER_BUS_DATA_PIN,
@@ -996,6 +1035,33 @@ static int read_line(char *buf, int len, int first_char)
     return n;
 }
 
+/* Same as read_line(), but when the stream goes quiet it waits up to wait_ms
+ * for the next character before deciding the line is finished.
+ *
+ * This is what makes a word command that starts with a single-letter command
+ * letter (SCAN vs S, CH vs C) work: the dispatcher consumes the first letter,
+ * and the rest of the word has to be collected even though it may still be in
+ * flight from the host. A bare key with no arguments still works - it just
+ * costs wait_ms. */
+static int read_line_timeout(char *buf, int len, int first_char, int wait_ms)
+{
+    int n = 0;
+    int64_t deadline_us = esp_timer_get_time() + (int64_t)wait_ms * 1000;
+    int c = (first_char >= 0) ? first_char : meter_getchar();
+    while (c >= 0 && c != '\n' && c != '\r') {
+        if (n < len - 1) {
+            buf[n++] = (char)c;
+        }
+        c = meter_getchar();
+        while (c < 0 && esp_timer_get_time() < deadline_us) {
+            vTaskDelay(pdMS_TO_TICKS(2));
+            c = meter_getchar();
+        }
+    }
+    buf[n] = '\0';
+    return n;
+}
+
 /* Split `s` (modified in place) on spaces into up to `max` tokens. */
 static int tokenize(char *s, char **tok, int max)
 {
@@ -1083,15 +1149,54 @@ static void meter_arm_download_and_restart(void)
     esp_restart();
 }
 
+/* Walk every named FPV channel and report the strongest: the setup tool a
+ * race timer needs, to find the channel the VTX is actually on.
+ *
+ * The 1 kHz task is paused for the duration and each channel is judged from
+ * its own raw samples. Feeding the shared pipeline instead would mix channels
+ * (its peak-hold still holds the previous channel) and would freeze completely
+ * whenever the stream is paused, which made every channel read the same value. */
+/* SCAN takes exactly one optional argument: the dwell in milliseconds.
+ * Silently reading a frequency range as a dwell was a real trap - "SCAN 5750
+ * 5900 10" used 5750 ms as the dwell and walked all 48 channels. */
+static bool meter_parse_scan_args(char *const *tok, int t, uint32_t *dwell_ms)
+{
+    if (t > 2) {
+        meter_printf("SCAN USAGE SCAN [dwell ms] - extra arguments are not a "
+                     "frequency range; retune with F<mhz> or CH <name>\n");
+        return false;
+    }
+    *dwell_ms = 500u;
+    if (t == 2) {
+        char *end = NULL;
+        unsigned long v = strtoul(tok[1], &end, 10);
+        if (end == tok[1] || (end && *end != '\0')) {
+            meter_printf("SCAN USAGE dwell must be a number of milliseconds\n");
+            return false;
+        }
+        *dwell_ms = (uint32_t)v;
+    }
+    return true;
+}
+
 static void meter_scan(uint32_t dwell_ms)
 {
-    if (dwell_ms == 0) {
-        dwell_ms = 50;
+    if (dwell_ms < 20u) {
+        dwell_ms = 120u;
     }
+    if (dwell_ms > 1000u) {
+        dwell_ms = 1000u;
+    }
+
     uint16_t restore = s_tuned_mhz;
-    uint16_t peak_mhz = 0;
-    float peak_db = -200.0f;
+    bool was_paused = s_stream_paused;
+    s_stream_paused = true;
+
+    const fpv_channel_t *best[3] = {NULL, NULL, NULL};
+    float best_db[3] = {0.0f, 0.0f, 0.0f};
+    size_t measured = 0u;
     meter_printf("SCAN start dwell=%u ms\n", (unsigned)dwell_ms);
+
     for (size_t i = 0u; i < rf_get_channel_count(); ++i) {
         const fpv_channel_t *ch = rf_get_channel_at(i);
         if (ch == NULL) {
@@ -1112,22 +1217,84 @@ static void meter_scan(uint32_t dwell_ms)
         }
         uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
         meter_tune(ch->freq_mhz, now_ms);
-        vTaskDelay(pdMS_TO_TICKS(s_pipe.cfg.settle_ms + dwell_ms));
-        /* Peak over the dwell (the pipeline already peak-holds). */
-        float db = rssi_pipeline_smoothed_db(&s_pipe);
-        meter_printf("SCAN %s %u dB:%.1f\n", ch->name, ch->freq_mhz, db);
-        if (db > peak_db) {
-            peak_db = db;
-            peak_mhz = ch->freq_mhz;
+        vTaskDelay(pdMS_TO_TICKS(dwell_ms));
+
+        int vals[5];
+        int n = 0;
+        for (int k = 0; k < 5; ++k) {
+            int dbm = -127;
+            if (rf_try_get_wideband_rssi_dbm(&dbm)) {
+                vals[n++] = dbm;
+            }
+            vTaskDelay(pdMS_TO_TICKS(3));
+        }
+        if (n == 0) {
+            meter_printf("SCAN %s %u MHz no reading\n", ch->name, (unsigned)ch->freq_mhz);
+            continue;
+        }
+        for (int a = 1; a < n; ++a) {
+            for (int b = a; b > 0 && vals[b - 1] > vals[b]; --b) {
+                int t = vals[b - 1];
+                vals[b - 1] = vals[b];
+                vals[b] = t;
+            }
+        }
+        float db = (float)vals[n / 2];
+        meter_printf("SCAN %s %u MHz %.1f dB\n", ch->name, (unsigned)ch->freq_mhz, db);
+        measured++;
+
+        for (int s = 0; s < 3; ++s) {
+            if (best[s] == NULL || db > best_db[s]) {
+                for (int m = 2; m > s; --m) {
+                    best[m] = best[m - 1];
+                    best_db[m] = best_db[m - 1];
+                }
+                best[s] = ch;
+                best_db[s] = db;
+                break;
+            }
         }
     }
+
     if (restore != 0) {
         uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
         meter_tune(restore, now_ms);
     }
-    const fpv_channel_t *pch = peak_mhz ? rf_find_channel_by_freq(peak_mhz, 0) : NULL;
-    meter_printf("SCAN done peak=%s %u dB:%.1f\n",
-           pch ? pch->name : "--", peak_mhz, peak_db);
+    /* The learned quiet level belongs to one channel; after a scan it is
+     * meaningless, so re-learn it on the restored channel. */
+    rssi_pipeline_reset_baseline(&s_pipe);
+    s_state = METER_STATE_TUNING;
+
+    meter_printf("SCAN done measured=%u", (unsigned)measured);
+    for (int s = 0; s < 3; ++s) {
+        if (best[s]) {
+            meter_printf(" | %s %u MHz %.1f dB", best[s]->name,
+                   (unsigned)best[s]->freq_mhz, best_db[s]);
+        }
+    }
+    meter_printf(" restored=%u MHz\n", (unsigned)(restore ? restore : 0u));
+
+    s_stream_paused = was_paused;
+}
+
+/* A numeric token must be a complete number. strtof() happily returns 0.0 for
+ * "AN", and that is how one mistyped console line wrote a 0..120 dBm calibration
+ * window into a live meter. */
+static bool parse_float_strict(const char *s, float *out)
+{
+    if (!s) {
+        return false;
+    }
+    char *end = NULL;
+    float v = strtof(s, &end);
+    if (end == s || (end && *end != '\0')) {
+        return false;
+    }
+    if (!isfinite(v)) {
+        return false;
+    }
+    *out = v;
+    return true;
 }
 
 static void meter_calibration(int argc, char **argv)
@@ -1139,6 +1306,10 @@ static void meter_calibration(int argc, char **argv)
     }
     if (argc == 1 && !strcasecmp(argv[0], "lo")) {
         float v = rssi_pipeline_smoothed_db(&s_pipe);
+        if (v < -140.0f || v > 10.0f) {
+            meter_printf("CAL refused: current reading %.1f dB is not a valid level\n", v);
+            return;
+        }
         s_pipe.cfg.db_lo = v;
         s_cfg.db_lo = v;
         meter_printf("CAL db_lo=%.1f (from current reading)\n", v);
@@ -1146,22 +1317,33 @@ static void meter_calibration(int argc, char **argv)
     }
     if (argc == 1 && !strcasecmp(argv[0], "hi")) {
         float v = rssi_pipeline_smoothed_db(&s_pipe);
+        if (v < -140.0f || v > 10.0f) {
+            meter_printf("CAL refused: current reading %.1f dB is not a valid level\n", v);
+            return;
+        }
         s_pipe.cfg.db_hi = v;
         s_cfg.db_hi = v;
         meter_printf("CAL db_hi=%.1f (from current reading)\n", v);
         return;
     }
     if (argc == 2) {
-        float lo = strtof(argv[0], NULL);
-        float hi = strtof(argv[1], NULL);
-        if (hi > lo + 5.0f) {
-            rssi_pipeline_set_calibration(&s_pipe, lo, hi);
-            s_cfg.db_lo = lo;
-            s_cfg.db_hi = hi;
-            meter_printf("CAL db_lo=%.1f db_hi=%.1f\n", lo, hi);
-        } else {
-            meter_printf("CALUSAGE hi must be > lo + 5 dB\n");
+        float lo = 0.0f, hi = 0.0f;
+        if (!parse_float_strict(argv[0], &lo) || !parse_float_strict(argv[1], &hi)) {
+            meter_printf("CAL refused: both values must be numbers (CUSAGE C <lo> <hi>)\n");
+            return;
         }
+        /* Physical bounds, same rule meter_cfg_valid() applies to a saved
+         * config: a receiver never reports 0 dBm, and a window narrower than
+         * 5 dB makes the 0..255 output meaningless. */
+        if (lo < -140.0f || lo > -10.0f || hi < -100.0f || hi > 10.0f || hi <= lo + 5.0f) {
+            meter_printf("CAL refused: need lo in -140..-10, hi in -100..10, hi > lo+5 "
+                   "(got %.1f %.1f)\n", lo, hi);
+            return;
+        }
+        rssi_pipeline_set_calibration(&s_pipe, lo, hi);
+        s_cfg.db_lo = lo;
+        s_cfg.db_hi = hi;
+        meter_printf("CAL db_lo=%.1f db_hi=%.1f\n", lo, hi);
     } else {
         meter_printf("CALUSAGE C [lo hi] | C lo | C hi\n");
     }
@@ -1188,7 +1370,92 @@ static void meter_defaults(void)
     meter_cfg_defaults(&d);
     s_cfg = d;
     meter_apply_cfg_to_pipeline();
-    meter_printf("DEFAULTS applied (P saves, B+P keeps)\n");
+    meter_printf("DEFAULTS applied (P saves)\n");
+}
+
+/* ---- Z diagnostics: is the RF front end actually measuring? ----
+ * Two questions this meter cannot answer from the RSSI number alone:
+ *
+ * 1. Is the PHY receiving anything at all? A pure analog FPV transmitter is
+ *    not an 802.11 station, so the Wi-Fi stack only reports frames when real
+ *    preambles are present. The promiscuous callback already installed by
+ *    rf_start() is replaced here, which is safe because the meter has no
+ *    video path to feed. Zero frames with a strong RSSI reading means the
+ *    reading is not a reception event.
+ *
+ * 2. Is the RSSI register alive? A value that never changes is a latched
+ *    register, not a measurement (the pipeline already refuses to call a
+ *    frozen reading 'signal present', see fresh_ms). Z <seconds> prints the
+ *    distinct raw values seen in that window.
+ */
+static volatile uint32_t s_diag_frames;
+static volatile int s_diag_last_rssi = -128;
+static volatile uint8_t s_diag_last_chan;
+static volatile uint8_t s_diag_last_sec;
+
+static void meter_sniffer_cb(void *buf, wifi_promiscuous_pkt_type_t type)
+{
+    const wifi_pkt_rx_ctrl_t *c = (const wifi_pkt_rx_ctrl_t *)buf;
+    s_diag_frames++;
+    s_diag_last_rssi = (int)c->rssi;
+    s_diag_last_chan = (uint8_t)c->channel;
+    s_diag_last_sec = (uint8_t)c->second;
+}
+
+static void meter_diag(int seconds)
+{
+    bool was_paused = s_stream_paused;
+    s_stream_paused = true;
+
+    bool sniffer_was = false;
+    (void)esp_wifi_get_promiscuous(&sniffer_was);
+    esp_err_t err = esp_wifi_set_promiscuous_rx_cb(meter_sniffer_cb);
+    if (err != ESP_OK) {
+        meter_printf("Z WARN rx_cb install %s\n", esp_err_to_name(err));
+    }
+    if (!sniffer_was) (void)esp_wifi_set_promiscuous(true);
+
+    uint32_t f0 = s_diag_frames;
+    int seen[16];
+    int nseen = 0;
+    int total = 0;
+    int nf_bad = 0;
+    const int period_ms = (seconds > 0) ? 10 : 1000;
+    const int ticks = (seconds > 0) ? (seconds * 100) : 1;
+
+    for (int i = 0; i < ticks; ++i) {
+        int rssi = -128, nf = -128;
+        bool ok = rf_try_get_wideband_rssi_dbm(&rssi);
+        if (!rf_try_get_noise_floor_dbm(&nf)) nf_bad++;
+        if (ok) {
+            total++;
+            bool dup = false;
+            for (int j = 0; j < nseen; ++j) {
+                if (seen[j] == rssi) { dup = true; break; }
+            }
+            if (!dup && nseen < (int)(sizeof(seen) / sizeof(seen[0]))) {
+                seen[nseen++] = rssi;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(period_ms));
+    }
+
+    uint32_t f1 = s_diag_frames;
+    meter_printf("Z f=%u gain=%d frames=%u (%.0f/s) frame_rssi=%d chan=%u sec=%u\n",
+           (unsigned)s_tuned_mhz, s_meter_gain,
+           (unsigned)(f1 - f0), (double)(f1 - f0) / (double)(ticks * period_ms / 1000),
+           s_diag_last_rssi, s_diag_last_chan, s_diag_last_sec);
+    meter_printf("Z phy_rssi readings=%d distinct=%d", total, nseen);
+    for (int j = 0; j < nseen; ++j) meter_printf(" %d", seen[j]);
+    meter_printf(" nf_invalid=%d/%d\n", nf_bad, ticks);
+    if (nseen <= 1) {
+        meter_printf("Z VERDICT frozen: the PHY RSSI register did not move "
+                     "(%d distinct value in %.1f s) - treat it as latched\n",
+                     nseen, (double)(ticks * period_ms / 1000));
+    }
+    if (sniffer_was) (void)esp_wifi_set_promiscuous_rx_cb(NULL);
+    else (void)esp_wifi_set_promiscuous(false);
+    s_stream_paused = was_paused;
 }
 
 void app_main(void)
@@ -1431,7 +1698,20 @@ void app_main(void)
             vTaskDelay(pdMS_TO_TICKS(150));
             esp_restart();
         } else if (c == 'S' || c == 's') {
-            meter_gain_sweep();
+            /* 'S' is the gain sweep, but the word command SCAN starts with the
+             * same letter. Without this lookahead "SCAN 120" ran the sweep and
+             * then handed "AN 120" to the calibration command. */
+            read_line_timeout(line, sizeof(line), -1, 60);
+            char *tok[3] = {NULL, NULL, NULL};
+            int t = tokenize(line, tok, 3);
+            if (t >= 1 && !strcasecmp(tok[0], "CAN")) {
+                uint32_t dwell;
+                if (meter_parse_scan_args(tok, t, &dwell)) meter_scan(dwell);
+            } else if (t == 0) {
+                meter_gain_sweep();
+            } else {
+                meter_printf("SUSAGE S (gain sweep) or SCAN [dwell ms]\n");
+            }
         } else if (c == 'V' || c == 'v') {
             s_dac_invert = !s_dac_invert;
             s_cfg.dac_invert = s_dac_invert;
@@ -1458,10 +1738,20 @@ void app_main(void)
                 meter_printf("FUSAGE F<mhz> or F<band><n>, e.g. F5800 / F R4\n");
             }
         } else if (c == 'C' || c == 'c') {
-            read_line(line, sizeof(line), -1);
+            /* 'C' is calibration, and the word command CH starts with the same
+             * letter. Same lookahead rule as S/SCAN above. */
+            read_line_timeout(line, sizeof(line), -1, 60);
             char *tok[3] = {NULL, NULL, NULL};
             int t = tokenize(line, tok, 3);
-            meter_calibration(t, tok);
+            if (t >= 1 && !strcasecmp(tok[0], "H")) {
+                if (t >= 2) {
+                    meter_set_frequency(parse_freq_token(tok[1]));
+                } else {
+                    meter_printf("CHUSAGE CH <band><n>, e.g. CH R4\n");
+                }
+            } else {
+                meter_calibration(t, tok);
+            }
         } else if (c == 'K' || c == 'k') {
             read_line(line, sizeof(line), -1);
             char *tok[3] = {NULL, NULL, NULL};
@@ -1471,12 +1761,17 @@ void app_main(void)
                 s_cfg.knee_ratio = 1.0f;
                 meter_printf("KNEE off\n");
             } else if (t == 2) {
-                float db = strtof(tok[0], NULL);
-                float r = strtof(tok[1], NULL);
-                rssi_pipeline_set_knee(&s_pipe, db, r);
-                s_cfg.knee_db = db;
-                s_cfg.knee_ratio = s_pipe.cfg.knee_ratio;
-                meter_printf("KNEE db=%.1f ratio=%.1f (P saves)\n", db, s_pipe.cfg.knee_ratio);
+                float db = 0.0f, r = 0.0f;
+                if (!parse_float_strict(tok[0], &db) || !parse_float_strict(tok[1], &r)) {
+                    meter_printf("K refused: both values must be numbers\n");
+                } else if (db < -140.0f || db > 10.0f || r < 1.0f || r > 10.0f) {
+                    meter_printf("K refused: db must be -140..10, ratio 1..10\n");
+                } else {
+                    rssi_pipeline_set_knee(&s_pipe, db, r);
+                    s_cfg.knee_db = db;
+                    s_cfg.knee_ratio = s_pipe.cfg.knee_ratio;
+                    meter_printf("KNEE db=%.1f ratio=%.1f (P saves)\n", db, s_pipe.cfg.knee_ratio);
+                }
             } else {
                 meter_printf("KUSAGE K <db> <ratio> | K off\n");
             }
@@ -1545,6 +1840,13 @@ void app_main(void)
         } else if (c == 'P' || c == 'p') {
             bool ok = meter_cfg_save(&s_cfg);
             meter_printf("SAVE %s (boot_mhz=%u)\n", ok ? "ok" : "FAILED", s_cfg.boot_mhz);
+        } else if (c == 'Z' || c == 'z') {
+            read_line_timeout(line, sizeof(line), -1, 40);
+            char *tok[1] = {NULL};
+            int t = tokenize(line, tok, 1);
+            int secs = (t >= 1) ? (int)strtol(tok[0], NULL, 10) : 0;
+            if (secs < 0 || secs > 30) secs = 0;
+            meter_diag(secs);
         } else if (c == 'D' || c == 'd') {
             meter_defaults();
         } else if (c == 'O' || c == 'o') {
@@ -1572,8 +1874,8 @@ void app_main(void)
             char *tok[3] = {NULL, NULL, NULL};
             int t = tokenize(line, tok, 3);
             if (t >= 1 && !strcasecmp(tok[0], "SCAN")) {
-                uint32_t dwell = (t >= 2) ? (uint32_t)strtoul(tok[1], NULL, 10) : 0u;
-                meter_scan(dwell);
+                uint32_t dwell;
+                if (meter_parse_scan_args(tok, t, &dwell)) meter_scan(dwell);
             } else if (t >= 2 && !strcasecmp(tok[0], "CH")) {
                 meter_set_frequency(parse_freq_token(tok[1]));
             } else if (t >= 1) {

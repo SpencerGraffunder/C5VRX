@@ -454,4 +454,59 @@ Host unit test (48 checks, byte-for-byte against the server's expectations):
 cc -I main tools/test_rh_node.c main/rh_node.c -lm -o /tmp/test_rh_node && /tmp/test_rh_node
 ```
 
-Not yet hardware-verified: the node layer needs a flash, which needs a reset.
+Hardware-verified on the C5 DevKit over the board's native USB cable: the
+discovery replies, the 16-byte firmware text blocks, `READ_FREQUENCY` and the
+crossing/lap frames all answered, and the node entered RotorHazard mode when a
+transmitter was present.
+
+## Receive-liveness diagnostics (`Z`, `RX`, `! RX STALE`)
+
+A perfect 1 kHz stream is **not** proof that the receiver is receiving. The meter
+now proves it separately.
+
+`Z [sec]` answers the two questions a raw number cannot:
+
+- **frames/s** - how many 802.11 frames the promiscuous callback saw. An analog
+  FPV transmitter has no 802.11 preamble, so zero frames is normal for the VTX;
+  it is **not** normal when tuned onto a real access point.
+- **distinct PHY RSSI values** in the window. One distinct value means the
+  register is latched, not measuring.
+
+`Z` temporarily enables promiscuous mode and always restores the previous state
+(an earlier version left it on permanently and measurably degraded the receive
+path - that restore is now explicit).
+
+The output task runs a watchdog: if the raw RSSI holds one value for more than
+5 s it prints
+
+```text
+! RX STALE raw RSSI held at -82 dBm for 45011 ms (noise floor invalid 25647/25647)
+  - the PHY detector is not updating, so these readings are not measurements
+```
+
+and `T` carries `RX raw:<v> nf_invalid:<bad>/<total>` so a host or lap timer can
+see the health of the measurement, not just its value. A lap timer fed by a
+frozen RSSI fires on every lap or none, so this state must never look like data.
+
+### Open hardware finding (2026-10-05)
+
+On the bench C5 DevKit the detector stopped producing valid measurements:
+
+| observation | value |
+|---|---|
+| stream rate | 1152 samples/s, stable |
+| raw RSSI | one value for the whole window (`distinct=1`) |
+| noise floor | invalid on **100%** of samples (`nf_invalid:10282/10282`) |
+| fixed-gain sweep G15..G81 | flat at -79/-80 dBm, no gain dependence |
+| frames at 5700 MHz | **0** while the host Mac was associated to a -49 dBm 802.11ax AP on that channel |
+
+This is not caused by the diagnostics: the same state was measured after
+`git stash`-ing them and reflashing the previous commit, and it survived a
+firmware reboot (`B`). It means the PHY RSSI/noise-floor detectors were not
+clocked, so every number that meter printed in that state was a latch value.
+
+Until this is reproduced against a known-good reference (the normal video
+firmware's own `RSSI=` status field on the same board), do not treat any RSSI
+number from this bench session as a measurement, and do not tune the DAC window
+or the signal-present margin from it.
+
