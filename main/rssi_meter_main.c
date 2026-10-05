@@ -109,6 +109,7 @@
 #include <math.h>
 #include <strings.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -124,6 +125,7 @@
 #include "nvs_flash.h"
 #include "soc/uart_pins.h"
 #include "driver/uart.h"
+#include "driver/usb_serial_jtag.h"
 #include "rf.h"
 #include "rssi_pipeline.h"
 #include "rssi_sdm.h"
@@ -395,6 +397,81 @@ static void node_feed(uint8_t counts, uint32_t now_ms)
     xSemaphoreGive(s_node_mutex);
 }
 
+/* ---- Routed console I/O -------------------------------------------------
+ * The meter is reachable over two physical ports and both are legitimate in
+ * the timer role:
+ *   - UART0: the board's USB-UART bridge, or a plain serial lead from a timer
+ *   - the built-in USB-Serial/JTAG CDC port: the board's USB socket
+ * A RotorHazard server reads exactly payload+checksum from the port it wrote
+ * to, so a reply must leave by the port it was asked on; replying on the other
+ * port breaks that server's framing. meter_getchar() records which port a byte
+ * arrived on and every write below follows it, so a command typed on either
+ * cable is answered on that same cable. This also removes the old trap where
+ * the whole console silently lived on whichever port CONFIG_ESP_CONSOLE picked.
+ */
+typedef enum {
+    MPORT_PRIMARY = 0,   /* whatever CONFIG_ESP_CONSOLE selects (stdout) */
+    MPORT_UART = 1,
+    MPORT_USBJTAG = 2,
+} mport_t;
+
+static mport_t s_out_port = MPORT_PRIMARY;
+static bool s_uart_rx_ready = false;
+static bool s_usbjtag_rx_ready = false;
+
+static void meter_write_bytes(const uint8_t *b, int len)
+{
+    if (len <= 0) {
+        return;
+    }
+    if (s_out_port == MPORT_UART && s_uart_rx_ready) {
+        uart_write_bytes(UART_NUM_0, (const char *)b, (size_t)len);
+        return;
+    }
+    if (s_out_port == MPORT_USBJTAG && s_usbjtag_rx_ready) {
+        usb_serial_jtag_write_bytes(b, (size_t)len, 0);
+        return;
+    }
+    fwrite(b, 1, (size_t)len, stdout);
+}
+
+static void meter_flush(void)
+{
+    if (s_out_port == MPORT_USBJTAG && s_usbjtag_rx_ready) {
+        usb_serial_jtag_wait_tx_done(pdMS_TO_TICKS(200));
+        return;
+    }
+    fflush(stdout);
+}
+
+static int meter_printf(const char *fmt, ...)
+{
+    char small[256];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(small, sizeof(small), fmt, ap);
+    va_end(ap);
+    if (n <= 0) {
+        return n;
+    }
+    if (n < (int)sizeof(small)) {
+        meter_write_bytes((const uint8_t *)small, n);
+        return n;
+    }
+    /* Long blocks (help text) must not be silently truncated. */
+    char *big = malloc((size_t)n + 1u);
+    if (!big) {
+        meter_write_bytes((const uint8_t *)small, (int)sizeof(small) - 1);
+        return n;
+    }
+    va_start(ap, fmt);
+    vsnprintf(big, (size_t)n + 1u, fmt, ap);
+    va_end(ap);
+    meter_write_bytes((const uint8_t *)big, n);
+    free(big);
+    return n;
+}
+
 static void meter_output_task(void *arg)
 {
     for (;;) {
@@ -432,7 +509,7 @@ static void meter_output_task(void *arg)
         if (sig != s_last_signal) {
             s_last_signal = sig;
             if (!s_node_mode) {
-                printf("EVENT %s f=%u sig=%.1f dB base=%.1f\n",
+                meter_printf("EVENT %s f=%u sig=%.1f dB base=%.1f\n",
                        sig ? "present" : "clear", s_tuned_mhz,
                        rssi_pipeline_signal_db(&s_pipe),
                        rssi_pipeline_baseline_db(&s_pipe));
@@ -453,7 +530,7 @@ static void meter_output_task(void *arg)
 
         if (!s_stream_paused && rssi_ok && !s_node_mode) {
             bool native = rf_native_agc_active();
-            printf("R:%d NF:%d G:%d M:%d P:%u S:%d\n",
+            meter_printf("R:%d NF:%d G:%d M:%d P:%u S:%d\n",
                    rssi,
                    nf_ok ? nf : -127,
                    native ? -1 : s_meter_gain,
@@ -675,7 +752,7 @@ static void meter_bus_task(void *arg)
 /* ---- Console ---- */
 static void meter_help(void)
 {
-    printf("RSSI_METER commands:\n"
+    meter_printf("RSSI_METER commands:\n"
            " H   this help\n"
            " T   status line (includes bus stats)\n"
            " N   toggle native HW AGC (persist, reboot)\n"
@@ -713,7 +790,7 @@ static const char *state_name(uint8_t s)
 static void meter_status(void)
 {
     const fpv_channel_t *ch = rf_find_channel_by_freq(s_tuned_mhz, 0);
-    printf("ST f:%u%s mode:%s state:%s cal:%.0f..%.0f dB ema:%.2f win:%u ms "
+    meter_printf("ST f:%u%s mode:%s state:%s cal:%.0f..%.0f dB ema:%.2f win:%u ms "
            "knee:%.0f/%.1f sig:%d/%.0f dB base:%.1f fresh:%d dac_pol:%s "
            "paused:%d gain:%d\n",
            s_tuned_mhz, ch ? ch->name : "",
@@ -730,14 +807,19 @@ static void meter_status(void)
            s_dac_invert ? "inverted" : "normal",
            s_stream_paused ? 1 : 0,
            s_meter_gain);
+    meter_printf("CONSOLE uart:%s usbjtag:%s reply_to:%s\n",
+           s_uart_rx_ready ? "ready" : "none",
+           s_usbjtag_rx_ready ? "ready" : "none",
+           s_out_port == MPORT_UART ? "uart" :
+           (s_out_port == MPORT_USBJTAG ? "usbjtag" : "primary"));
 #ifdef CONFIG_C5VRX_RSSI_BUS
-    printf("BUS sel:%d clk:%d data:%d frames:%lu writes:%lu reads:%u last:0x%05lX read@0x%X\n",
+    meter_printf("BUS sel:%d clk:%d data:%d frames:%lu writes:%lu reads:%u last:0x%05lX read@0x%X\n",
            (int)METER_BUS_SEL_PIN, (int)METER_BUS_CLK_PIN, (int)METER_BUS_DATA_PIN,
            (unsigned long)s_bus_frames, (unsigned long)s_bus_writes,
            (unsigned)s_bus_reads, (unsigned long)s_bus_last_word,
            (unsigned)s_bus_last_read_addr);
 #endif
-    printf("NODE mode:%s enter:%d exit:%d minlap:%lu lap:%d current:%d peak:%d nadir:%d "
+    meter_printf("NODE mode:%s enter:%d exit:%d minlap:%lu lap:%d current:%d peak:%d nadir:%d "
            "laps:%lu reads:%lu errors:%lu\n",
            s_node_mode ? "rotorhazard" : "console",
            s_node.enter_at, s_node.exit_at,
@@ -767,8 +849,8 @@ static void node_handle_byte(uint8_t c)
     xSemaphoreGive(s_node_mutex);
 
     if (len > 0) {
-        fwrite(out, 1, (size_t)len, stdout);
-        fflush(stdout);
+        meter_write_bytes(out, len);
+        meter_flush();
     }
 
     /* Actions after the reply, so a retune never delays a checksum. */
@@ -783,13 +865,13 @@ static void node_handle_byte(uint8_t c)
 static void meter_gain_sweep(void)
 {
     if (rf_native_agc_active()) {
-        printf("SWEEP REFUSED reason=native_agc_active gain_writes_must_stay_refused\n");
+        meter_printf("SWEEP REFUSED reason=native_agc_active gain_writes_must_stay_refused\n");
         return;
     }
     /* Same spread as the video-firmware RSSI oracle (serial R). */
     static const uint8_t gains[] = {15u, 31u, 47u, 63u, 79u, 81u};
     const int restore = s_meter_gain;
-    printf("SWEEP start f=%u restore_g=%d\n", s_tuned_mhz, restore);
+    meter_printf("SWEEP start f=%u restore_g=%d\n", s_tuned_mhz, restore);
     for (unsigned i = 0u; i < sizeof(gains) / sizeof(gains[0]); ++i) {
         rf_set_rx_gain(true, gains[i]);
         s_meter_gain = gains[i];
@@ -798,13 +880,13 @@ static void meter_gain_sweep(void)
         int nf = -127;
         bool rssi_ok = rf_try_get_wideband_rssi_dbm(&rssi);
         bool nf_ok = rf_try_get_noise_floor_dbm(&nf);
-        printf("SWEEP G:%u R:%d NF:%d\n",
+        meter_printf("SWEEP G:%u R:%d NF:%d\n",
                (unsigned)gains[i], rssi_ok ? rssi : -127, nf_ok ? nf : -127);
     }
     rf_set_rx_gain(true, (uint8_t)restore);
     s_meter_gain = restore;
     vTaskDelay(pdMS_TO_TICKS(150));
-    printf("SWEEP done restored G:%d\n", restore);
+    meter_printf("SWEEP done restored G:%d\n", restore);
 }
 
 /* Console RX through the UART driver, not the ROM "basic" console path.
@@ -821,13 +903,12 @@ static void meter_gain_sweep(void)
  * (U0RXD_GPIO_NUM / U0TXD_GPIO_NUM); meter_getchar() is the only reader, so the
  * VFS console and the driver never compete for the same byte.
  */
-static bool s_uart_rx_ready = false;
 
 static void meter_console_rx_init(void)
 {
     const int rx = U0RXD_GPIO_NUM, tx = U0TXD_GPIO_NUM;
     if (rx < 0 || tx < 0) {
-        printf("RSSI_METER console RX: no default UART pins, using ROM path\n");
+        meter_printf("RSSI_METER console RX: no default UART pins, using ROM path\n");
         return;
     }
     if (uart_is_driver_installed(UART_NUM_0)) {
@@ -847,21 +928,54 @@ static void meter_console_rx_init(void)
     if (err == ESP_OK) err = uart_set_pin(UART_NUM_0, tx, rx, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     if (err == ESP_OK) err = uart_driver_install(UART_NUM_0, 1024, 0, 0, NULL, 0);
     if (err != ESP_OK) {
-        printf("RSSI_METER console RX: driver failed (%s), using ROM path\n", esp_err_to_name(err));
+        meter_printf("RSSI_METER console RX: driver failed (%s), using ROM path\n", esp_err_to_name(err));
         return;
     }
     s_uart_rx_ready = true;
-    printf("RSSI_METER console RX: UART0 driver rx=GPIO%d tx=GPIO%d\n", rx, tx);
+    meter_printf("RSSI_METER console RX: UART0 driver rx=GPIO%d tx=GPIO%d\n", rx, tx);
+}
+
+/* Install the USB-Serial/JTAG driver so the board's USB socket is a real
+ * command input too, not just a place where boot text happens to appear. */
+static void meter_usbjtag_rx_init(void)
+{
+    if (usb_serial_jtag_is_driver_installed()) {
+        s_usbjtag_rx_ready = true;
+        return;
+    }
+    usb_serial_jtag_driver_config_t cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
+    if (usb_serial_jtag_driver_install(&cfg) == ESP_OK) {
+        s_usbjtag_rx_ready = true;
+    } else {
+        meter_printf("RSSI_METER console RX: USB-JTAG driver failed, UART only\n");
+    }
 }
 
 static int meter_getchar(void)
 {
     if (s_uart_rx_ready) {
         uint8_t c;
-        if (uart_read_bytes(UART_NUM_0, &c, 1, 0) == 1) return c;
-        return -1;
+        if (uart_read_bytes(UART_NUM_0, &c, 1, 0) == 1) {
+            s_out_port = MPORT_UART;
+            return c;
+        }
     }
-    return getchar();
+    if (s_usbjtag_rx_ready) {
+        uint8_t c;
+        if (usb_serial_jtag_read_bytes(&c, 1, 0) == 1) {
+            s_out_port = MPORT_USBJTAG;
+            return c;
+        }
+    }
+    if (!s_uart_rx_ready && !s_usbjtag_rx_ready) {
+        /* No driver on either port: only the ROM console path is left. */
+        int c = getchar();
+        if (c >= 0) {
+            s_out_port = MPORT_PRIMARY;
+        }
+        return c;
+    }
+    return -1;
 }
 
 /* Read the rest of the current line (to newline/EOS) into buf. A
@@ -929,7 +1043,7 @@ static uint16_t parse_freq_token(const char *t)
 static void meter_set_frequency(uint16_t mhz)
 {
     if (mhz == 0) {
-        printf("FUSAGE F<mhz> or F<band><n>, e.g. F5800 / F R4\n");
+        meter_printf("FUSAGE F<mhz> or F<band><n>, e.g. F5800 / F R4\n");
         return;
     }
     uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
@@ -939,7 +1053,7 @@ static void meter_set_frequency(uint16_t mhz)
         return;   /* node mode owns the port: no console output */
     }
     const fpv_channel_t *ch = rf_find_channel_by_freq(s_tuned_mhz, 0);
-    printf("F:%u err=%s%s (P saves as boot frequency)\n",
+    meter_printf("F:%u err=%s%s (P saves as boot frequency)\n",
            mhz, esp_err_to_name(err), ch ? ch->name : "");
 }
 
@@ -963,9 +1077,9 @@ static void meter_arm_download_and_restart(void)
         gpio_set_level(METER_DOWNLOAD_ARM_GPIO, 0);
         vTaskDelay(pdMS_TO_TICKS(50));
     }
-    printf("RSSI_METER download-armed: flash now with "
+    meter_printf("RSSI_METER download-armed: flash now with "
            "--before no_reset --after watchdog_reset\n");
-    fflush(stdout);
+    meter_flush();
     esp_restart();
 }
 
@@ -977,7 +1091,7 @@ static void meter_scan(uint32_t dwell_ms)
     uint16_t restore = s_tuned_mhz;
     uint16_t peak_mhz = 0;
     float peak_db = -200.0f;
-    printf("SCAN start dwell=%u ms\n", (unsigned)dwell_ms);
+    meter_printf("SCAN start dwell=%u ms\n", (unsigned)dwell_ms);
     for (size_t i = 0u; i < rf_get_channel_count(); ++i) {
         const fpv_channel_t *ch = rf_get_channel_at(i);
         if (ch == NULL) {
@@ -1001,7 +1115,7 @@ static void meter_scan(uint32_t dwell_ms)
         vTaskDelay(pdMS_TO_TICKS(s_pipe.cfg.settle_ms + dwell_ms));
         /* Peak over the dwell (the pipeline already peak-holds). */
         float db = rssi_pipeline_smoothed_db(&s_pipe);
-        printf("SCAN %s %u dB:%.1f\n", ch->name, ch->freq_mhz, db);
+        meter_printf("SCAN %s %u dB:%.1f\n", ch->name, ch->freq_mhz, db);
         if (db > peak_db) {
             peak_db = db;
             peak_mhz = ch->freq_mhz;
@@ -1012,14 +1126,14 @@ static void meter_scan(uint32_t dwell_ms)
         meter_tune(restore, now_ms);
     }
     const fpv_channel_t *pch = peak_mhz ? rf_find_channel_by_freq(peak_mhz, 0) : NULL;
-    printf("SCAN done peak=%s %u dB:%.1f\n",
+    meter_printf("SCAN done peak=%s %u dB:%.1f\n",
            pch ? pch->name : "--", peak_mhz, peak_db);
 }
 
 static void meter_calibration(int argc, char **argv)
 {
     if (argc == 0) {
-        printf("CAL db_lo=%.1f db_hi=%.1f (0..255)\n",
+        meter_printf("CAL db_lo=%.1f db_hi=%.1f (0..255)\n",
                s_pipe.cfg.db_lo, s_pipe.cfg.db_hi);
         return;
     }
@@ -1027,14 +1141,14 @@ static void meter_calibration(int argc, char **argv)
         float v = rssi_pipeline_smoothed_db(&s_pipe);
         s_pipe.cfg.db_lo = v;
         s_cfg.db_lo = v;
-        printf("CAL db_lo=%.1f (from current reading)\n", v);
+        meter_printf("CAL db_lo=%.1f (from current reading)\n", v);
         return;
     }
     if (argc == 1 && !strcasecmp(argv[0], "hi")) {
         float v = rssi_pipeline_smoothed_db(&s_pipe);
         s_pipe.cfg.db_hi = v;
         s_cfg.db_hi = v;
-        printf("CAL db_hi=%.1f (from current reading)\n", v);
+        meter_printf("CAL db_hi=%.1f (from current reading)\n", v);
         return;
     }
     if (argc == 2) {
@@ -1044,12 +1158,12 @@ static void meter_calibration(int argc, char **argv)
             rssi_pipeline_set_calibration(&s_pipe, lo, hi);
             s_cfg.db_lo = lo;
             s_cfg.db_hi = hi;
-            printf("CAL db_lo=%.1f db_hi=%.1f\n", lo, hi);
+            meter_printf("CAL db_lo=%.1f db_hi=%.1f\n", lo, hi);
         } else {
-            printf("CALUSAGE hi must be > lo + 5 dB\n");
+            meter_printf("CALUSAGE hi must be > lo + 5 dB\n");
         }
     } else {
-        printf("CALUSAGE C [lo hi] | C lo | C hi\n");
+        meter_printf("CALUSAGE C [lo hi] | C lo | C hi\n");
     }
 }
 
@@ -1074,13 +1188,15 @@ static void meter_defaults(void)
     meter_cfg_defaults(&d);
     s_cfg = d;
     meter_apply_cfg_to_pipeline();
-    printf("DEFAULTS applied (P saves, B+P keeps)\n");
+    meter_printf("DEFAULTS applied (P saves, B+P keeps)\n");
 }
 
 void app_main(void)
 {
+    meter_printf("RSSI_METER start\n");
+    meter_flush();
     if ((uintptr_t)&_bss_end > 0x4082ffc0u) {
-        printf("RSSI_METER ERROR bss_overlaps_dump_banks\n");
+        meter_printf("RSSI_METER ERROR bss_overlaps_dump_banks\n");
         return;
     }
 
@@ -1092,11 +1208,15 @@ void app_main(void)
     *usage &= ~0x00010f00u;
     __asm__ __volatile__("fence iorw, iorw" ::: "memory");
 
+    meter_printf("RSSI_METER rf_start...\n");
+    meter_flush();
     esp_err_t err = rf_start();
     if (err != ESP_OK) {
-        printf("RSSI_METER ERROR rf_start=%s\n", esp_err_to_name(err));
+        meter_printf("RSSI_METER ERROR rf_start=%s\n", esp_err_to_name(err));
         return;
     }
+    meter_printf("RSSI_METER rf_start ok\n");
+    meter_flush();
 
     /* Load persisted settings before anything else user-visible. */
     meter_cfg_load(&s_cfg);
@@ -1108,9 +1228,11 @@ void app_main(void)
      * are GPIO 12 (RX) and GPIO 11 (TX) (soc/esp32c5/include/soc/uart_pins.h),
      * which are DAC bits 3 and 2. Driving them as outputs destroys the serial
      * link in both directions - the meter could not be talked to over the UART
-     * cable before this guard existed - so the meter must never own a pin the
-     * console is using. The physical ladder network is still wired to the full
-     * tested pin order; only the pins the console owns are left alone.
+     * cable before this guard existed - so a UART-console build must not own
+     * them unless CONFIG_C5VRX_RSSI_DAC_OWN_UART_PINS says the whole ladder is
+     * worth the UART port. The physical ladder network is still wired to the
+     * full tested pin order; only the pins the console owns are left alone.
+     * Either way the board's USB-Serial/JTAG port stays a working console.
      */
     gpio_config_t dac_cfg = {
         .pin_bit_mask = 0ULL,
@@ -1125,7 +1247,7 @@ void app_main(void)
 #else
         s_dac_active[i] = false;
 #endif
-#ifdef CONFIG_ESP_CONSOLE_UART
+#if defined(CONFIG_ESP_CONSOLE_UART) && !CONFIG_C5VRX_RSSI_DAC_OWN_UART_PINS
         if ((int)s_dac_gpio[i] == U0RXD_GPIO_NUM || (int)s_dac_gpio[i] == U0TXD_GPIO_NUM) {
             s_dac_active[i] = false;
         }
@@ -1136,14 +1258,14 @@ void app_main(void)
         }
     }
     if (dac_cfg.pin_bit_mask != 0ULL && (err = gpio_config(&dac_cfg)) != ESP_OK) {
-        printf("RSSI_METER ERROR dac_gpio=%s\n", esp_err_to_name(err));
+        meter_printf("RSSI_METER ERROR dac_gpio=%s\n", esp_err_to_name(err));
         return;
     }
 #ifndef CONFIG_C5VRX_RSSI_DAC_ENABLE
-    printf("RSSI_METER dac output disabled (ladder not fitted)\n");
-#elif defined(CONFIG_ESP_CONSOLE_UART)
+    meter_printf("RSSI_METER dac output disabled (ladder not fitted)\n");
+#elif defined(CONFIG_ESP_CONSOLE_UART) && !CONFIG_C5VRX_RSSI_DAC_OWN_UART_PINS
     if (!s_dac_active[2] || !s_dac_active[3]) {
-        printf("RSSI_METER dac partial: ladder pins %d/%d are the console UART and stay with the console\n",
+        meter_printf("RSSI_METER dac partial: ladder pins %d/%d are the console UART and stay with the console\n",
                U0RXD_GPIO_NUM, U0TXD_GPIO_NUM);
     }
 #endif
@@ -1183,7 +1305,7 @@ void app_main(void)
     bool sdm_on = rssi_sdm_begin(CONFIG_C5VRX_RSSI_SDM_PIN,
                                  CONFIG_C5VRX_RSSI_SDM_DIVIDER_M1000);
     if (CONFIG_C5VRX_RSSI_SDM_PIN >= 0 && !sdm_on) {
-        printf("RSSI_METER WARN sdm_begin failed (pin %d)\n",
+        meter_printf("RSSI_METER WARN sdm_begin failed (pin %d)\n",
                CONFIG_C5VRX_RSSI_SDM_PIN);
     }
 
@@ -1194,11 +1316,11 @@ void app_main(void)
     if (meter_bus_begin() &&
         xTaskCreatePinnedToCore(meter_bus_task, "rssi_bus", 4096, NULL, 7,
                                 NULL, 0) == pdPASS) {
-        printf("RSSI_METER bus ready (SEL %d CLK %d DATA %d)\n",
+        meter_printf("RSSI_METER bus ready (SEL %d CLK %d DATA %d)\n",
                (int)METER_BUS_SEL_PIN, (int)METER_BUS_CLK_PIN,
                (int)METER_BUS_DATA_PIN);
     } else {
-        printf("RSSI_METER WARN bus_begin failed (SEL %d CLK %d DATA %d)\n",
+        meter_printf("RSSI_METER WARN bus_begin failed (SEL %d CLK %d DATA %d)\n",
                (int)METER_BUS_SEL_PIN, (int)METER_BUS_CLK_PIN,
                (int)METER_BUS_DATA_PIN);
     }
@@ -1213,18 +1335,18 @@ void app_main(void)
     uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
     meter_tune(boot_mhz, now_ms);
     if (s_state == METER_STATE_FAULT) {
-        printf("RSSI_METER WARN tune %u MHz failed (staying %u MHz)\n",
+        meter_printf("RSSI_METER WARN tune %u MHz failed (staying %u MHz)\n",
                boot_mhz, rf_get_frequency_mhz());
         s_state = METER_STATE_IDLE;
     }
 
     if (xTaskCreatePinnedToCore(meter_output_task, "rssi_out", 4096, NULL, 6,
                                 NULL, 0) != pdPASS) {
-        printf("RSSI_METER ERROR output_task\n");
+        meter_printf("RSSI_METER ERROR output_task\n");
         return;
     }
 
-    printf("RSSI_METER READY f=%u mode=%s stream=%s dac=6bit cal=%.0f..%.0f dB "
+    meter_printf("RSSI_METER READY f=%u mode=%s stream=%s dac=6bit cal=%.0f..%.0f dB "
            "win=%u ms%s%s\n",
            s_tuned_mhz,
            rf_native_agc_active() ? "native_agc" : "forced",
@@ -1239,8 +1361,9 @@ void app_main(void)
 #endif
     );
     meter_console_rx_init();
+    meter_usbjtag_rx_init();
     meter_help();
-    fflush(stdout);
+    meter_flush();
 
     char line[64];
     for (;;) {
@@ -1257,8 +1380,8 @@ void app_main(void)
                 s_quiet = false;
                 s_cfg.node_mode = 0;
                 meter_cfg_save(&s_cfg);
-                printf("NODE mode off, console back (1 kHz stream resumes).\n");
-                fflush(stdout);
+                meter_printf("NODE mode off, console back (1 kHz stream resumes).\n");
+                meter_flush();
                 continue;
             }
             if (c == 'T' || c == 't') {
@@ -1277,8 +1400,8 @@ void app_main(void)
              * reply: the server reads exactly payload + checksum, then the
              * next poll flushes the leftover notice. */
             node_handle_byte((uint8_t)c);
-            printf("NODE detected (byte 0x%02X): node mode on, console off. Press M to return.\n", c);
-            fflush(stdout);
+            meter_printf("NODE detected (byte 0x%02X): node mode on, console off. Press M to return.\n", c);
+            meter_flush();
             s_node_mode = true;
             s_quiet = true;
             s_cfg.node_mode = 1;
@@ -1290,9 +1413,9 @@ void app_main(void)
             s_quiet = true;
             s_cfg.node_mode = 1;
             meter_cfg_save(&s_cfg);
-            printf("NODE mode on (RotorHazard protocol, saved). The port now answers "
+            meter_printf("NODE mode on (RotorHazard protocol, saved). The port now answers "
                    "server polls only; press M to return to the console.\n");
-            fflush(stdout);
+            meter_flush();
             continue;
         }
         if (c == 'H' || c == 'h') {
@@ -1302,9 +1425,9 @@ void app_main(void)
         } else if (c == 'N' || c == 'n') {
             bool enable = !rf_native_agc_active();
             err = rf_request_native_agc_boot(enable);
-            printf("RSSI_METER_NATIVE_AGC_ARMED next_boot=%s action=reboot err=%s\n",
+            meter_printf("RSSI_METER_NATIVE_AGC_ARMED next_boot=%s action=reboot err=%s\n",
                    enable ? "native_hw_agc" : "forced_gain", esp_err_to_name(err));
-            fflush(stdout);
+            meter_flush();
             vTaskDelay(pdMS_TO_TICKS(150));
             esp_restart();
         } else if (c == 'S' || c == 's') {
@@ -1312,13 +1435,13 @@ void app_main(void)
         } else if (c == 'V' || c == 'v') {
             s_dac_invert = !s_dac_invert;
             s_cfg.dac_invert = s_dac_invert;
-            printf("DAC_POL %s (P saves)\n", s_dac_invert ? "inverted" : "normal");
+            meter_printf("DAC_POL %s (P saves)\n", s_dac_invert ? "inverted" : "normal");
         } else if (c == 'L' || c == 'l') {
             s_stream_paused = !s_stream_paused;
-            printf("STREAM %s\n", s_stream_paused ? "paused" : "running");
+            meter_printf("STREAM %s\n", s_stream_paused ? "paused" : "running");
         } else if (c == 'B' || c == 'b') {
-            printf("RSSI_METER rebooting\n");
-            fflush(stdout);
+            meter_printf("RSSI_METER rebooting\n");
+            meter_flush();
             vTaskDelay(pdMS_TO_TICKS(100));
             esp_restart();
         } else if (c == 'U' || c == 'u') {
@@ -1332,7 +1455,7 @@ void app_main(void)
             if (t >= 1) {
                 meter_set_frequency(parse_freq_token(tok[0]));
             } else {
-                printf("FUSAGE F<mhz> or F<band><n>, e.g. F5800 / F R4\n");
+                meter_printf("FUSAGE F<mhz> or F<band><n>, e.g. F5800 / F R4\n");
             }
         } else if (c == 'C' || c == 'c') {
             read_line(line, sizeof(line), -1);
@@ -1346,16 +1469,16 @@ void app_main(void)
             if (t == 1 && !strcasecmp(tok[0], "off")) {
                 rssi_pipeline_set_knee(&s_pipe, s_pipe.cfg.knee_db, 1.0f);
                 s_cfg.knee_ratio = 1.0f;
-                printf("KNEE off\n");
+                meter_printf("KNEE off\n");
             } else if (t == 2) {
                 float db = strtof(tok[0], NULL);
                 float r = strtof(tok[1], NULL);
                 rssi_pipeline_set_knee(&s_pipe, db, r);
                 s_cfg.knee_db = db;
                 s_cfg.knee_ratio = s_pipe.cfg.knee_ratio;
-                printf("KNEE db=%.1f ratio=%.1f (P saves)\n", db, s_pipe.cfg.knee_ratio);
+                meter_printf("KNEE db=%.1f ratio=%.1f (P saves)\n", db, s_pipe.cfg.knee_ratio);
             } else {
-                printf("KUSAGE K <db> <ratio> | K off\n");
+                meter_printf("KUSAGE K <db> <ratio> | K off\n");
             }
         } else if (c == 'E' || c == 'e') {
             read_line(line, sizeof(line), -1);
@@ -1366,11 +1489,11 @@ void app_main(void)
                 if (a > 0.0f && a <= 1.0f) {
                     rssi_pipeline_set_ema_alpha(&s_pipe, a);
                     s_cfg.ema_alpha = a;
-                    printf("EMA alpha=%.2f (P saves)\n", a);
+                    meter_printf("EMA alpha=%.2f (P saves)\n", a);
                 }
             }
             if (t != 1) {
-                printf("EUSAGE E <alpha 0.01..1>\n");
+                meter_printf("EUSAGE E <alpha 0.01..1>\n");
             }
         } else if (c == 'W' || c == 'w') {
             read_line(line, sizeof(line), -1);
@@ -1383,11 +1506,11 @@ void app_main(void)
                     s_pipe.win_head = 0;
                     s_pipe.win_count = 0;
                     s_cfg.window_max_ms = (uint16_t)ms;
-                    printf("WINDOW %ld ms (P saves)\n", ms);
+                    meter_printf("WINDOW %ld ms (P saves)\n", ms);
                 }
             }
             if (t != 1) {
-                printf("WUSAGE W <ms 0..200>\n");
+                meter_printf("WUSAGE W <ms 0..200>\n");
             }
         } else if (c == 'A' || c == 'a') {
             read_line(line, sizeof(line), -1);
@@ -1398,12 +1521,12 @@ void app_main(void)
                 if (m > 0.0f && m <= 60.0f) {
                     rssi_pipeline_set_margin(&s_pipe, m, s_pipe.cfg.hysteresis_db);
                     s_cfg.margin_db = s_pipe.cfg.margin_db;
-                    printf("MARGIN %.1f dB (P saves)\n", s_pipe.cfg.margin_db);
+                    meter_printf("MARGIN %.1f dB (P saves)\n", s_pipe.cfg.margin_db);
                 } else {
-                    printf("AUSAGE A <margin dB 1..60>\n");
+                    meter_printf("AUSAGE A <margin dB 1..60>\n");
                 }
             } else {
-                printf("SIGNAL present=%d margin=%.1f hyst=%.1f base=%.1f "
+                meter_printf("SIGNAL present=%d margin=%.1f hyst=%.1f base=%.1f "
                        "sig=%.1f fresh=%d floor=%.0f\n",
                        rssi_pipeline_signal_present(&s_pipe) ? 1 : 0,
                        s_pipe.cfg.margin_db, s_pipe.cfg.hysteresis_db,
@@ -1418,10 +1541,10 @@ void app_main(void)
              * re-learn it whenever the site or the VTX changes. */
             rssi_pipeline_reset_baseline(&s_pipe);
             s_last_signal = false;
-            printf("BASELINE reset (re-learning from the next valid reading)\n");
+            meter_printf("BASELINE reset (re-learning from the next valid reading)\n");
         } else if (c == 'P' || c == 'p') {
             bool ok = meter_cfg_save(&s_cfg);
-            printf("SAVE %s (boot_mhz=%u)\n", ok ? "ok" : "FAILED", s_cfg.boot_mhz);
+            meter_printf("SAVE %s (boot_mhz=%u)\n", ok ? "ok" : "FAILED", s_cfg.boot_mhz);
         } else if (c == 'D' || c == 'd') {
             meter_defaults();
         } else if (c == 'O' || c == 'o') {
@@ -1431,15 +1554,15 @@ void app_main(void)
             int t = tokenize(line, tok, 2);
             if (t == 1 && !strcasecmp(tok[0], "off")) {
                 s_force_counts = -1;
-                printf("OUT restored\n");
+                meter_printf("OUT restored\n");
             } else if (t == 1) {
                 long v = strtol(tok[0], NULL, 10);
                 if (v >= 0 && v <= 255) {
                     s_force_counts = (int)v;
-                    printf("OUT fixed at %ld\n", v);
+                    meter_printf("OUT fixed at %ld\n", v);
                 }
             } else {
-                printf("OUTUSAGE OUT <0..255> | OUT off\n");
+                meter_printf("OUTUSAGE OUT <0..255> | OUT off\n");
             }
         } else if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
             /* skip */
@@ -1454,9 +1577,9 @@ void app_main(void)
             } else if (t >= 2 && !strcasecmp(tok[0], "CH")) {
                 meter_set_frequency(parse_freq_token(tok[1]));
             } else if (t >= 1) {
-                printf("RSSI_METER unknown cmd=%s (H for help)\n", tok[0]);
+                meter_printf("RSSI_METER unknown cmd=%s (H for help)\n", tok[0]);
             }
         }
-        fflush(stdout);
+        meter_flush();
     }
 }

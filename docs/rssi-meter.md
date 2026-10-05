@@ -100,10 +100,26 @@ The calibrated `0..255` value is what the analog outputs and the bus report
 the default calibration the DAC output reproduces the original dBm mapping
 exactly.
 
-## USB protocol
+## Console protocol
 
-Console is USB CDC (`CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y`). One line per
-sample at ~1 kHz (FreeRTOS 1 ms tick):
+The meter listens on **both** physical ports and answers on the one a command
+came in on:
+
+- **UART0** - the board's USB-UART bridge (GPIO 12 RX / GPIO 11 TX on the C5),
+  or a plain serial lead from a lap timer. This is the primary console
+  (`CONFIG_ESP_CONSOLE_UART_DEFAULT=y`).
+- **USB-Serial/JTAG** - the board's USB socket CDC port
+  (`CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=y`), always installed as a
+  command input by `meter_usbjtag_rx_init()`.
+
+`T` prints `CONSOLE uart:ready usbjtag:ready reply_to:<port>` so the active
+inputs and the reply target are visible. Replies are routed, not broadcast:
+a RotorHazard server reads exactly payload+checksum from the port it wrote to,
+so protocol bytes must leave by that same port. Before this routing existed the
+whole console silently lived on whichever port `CONFIG_ESP_CONSOLE` picked, and
+typing on the other port looked dead.
+
+One line per sample at ~1 kHz (FreeRTOS 1 ms tick):
 
 ```
 R:-72 NF:-95 G:47 M:0 P:167
@@ -132,6 +148,14 @@ The same D4..D9 resistor network as the video output
 - `V` inverts polarity at runtime.
 - `OUT n` fixes the level for wiring tests; `OUT off` restores the live
   value.
+- Pin tension: the tested ladder is wired to GPIO 23/24/11/12/8/9 and the C5
+  console UART defaults to GPIO 12 (RX) / GPIO 11 (TX), which are ladder bits
+  3 and 2. A UART-console build therefore leaves those two bits to the console
+  and the ladder outputs 4 of its 6 bits (`RSSI_METER dac partial: ...` at
+  boot). Set `CONFIG_C5VRX_RSSI_DAC_OWN_UART_PINS=y` to give the ladder all six
+  pins; the UART port then dies and the meter is reached through the USB-JTAG
+  port only. For a real timer connection prefer the RX5808 bus (GPIO 4/5/6) or
+  the sigma-delta output over reclaiming the UART pins.
 
 ### Sigma-delta analog output (optional, off by default)
 

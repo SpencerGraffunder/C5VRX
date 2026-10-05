@@ -13,6 +13,29 @@ config C5VRX_RSSI_METER
         flash the normal firmware again for picture. See docs/rssi-meter.md.
 
     if C5VRX_RSSI_METER
+        config C5VRX_RSSI_DAC_ENABLE
+            bool "Drive the six-bit resistor-ladder RSSI output"
+            default y
+            help
+                Off for boards where the ladder is not fitted, or where the
+                ladder pins collide with the console UART. On the ESP32-C5 the
+                console UART default pins are GPIO 12 (RX) and GPIO 11 (TX),
+                which are DAC bits 3 and 2, so a UART-console build must not
+                own them. See docs/rssi-meter.md.
+
+        config C5VRX_RSSI_DAC_OWN_UART_PINS
+            bool "Let the ladder own the console UART pins (USB-JTAG console only)"
+            default n
+            depends on C5VRX_RSSI_DAC_ENABLE
+            help
+                The tested XIAO ladder is wired to GPIO 23/24/11/12/8/9, so the
+                full six-bit network needs the two pins the console UART also
+                wants. With this off the meter leaves those bits to the console
+                and the UART lead (commands, the 1 kHz stream, the RotorHazard
+                serial protocol) works. With this on the ladder is complete and
+                the meter is reached only through the board's USB-Serial/JTAG
+                port, which the meter always listens on as well.
+
         config C5VRX_RSSI_BUS
             bool "RX5808 3-wire bus (timer drop-in compatibility)"
             default y
