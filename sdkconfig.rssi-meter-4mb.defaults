@@ -1,1 +1,26 @@
+# Standalone ~1 kHz RSSI meter build for boards with a real USB-to-UART bridge.
+# See docs/rssi-meter.md. Layered on top of sdkconfig.defaults.
+
+# The image header must match the board flash size: an 8MB-stamped app on a
+# 4MB devkit asserts in esp_flash_spi_init at boot and crash-loops.
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# Console routing. Normal C5VRX builds use USB-Serial/JTAG as the console,
+# which is why the meter was silent on the UART cable: printf/getchar go to
+# whichever console the config selects, not to whichever cable is plugged in.
+# UART is primary here because a real bridge has DTR/RTS physically wired to
+# BOOT and EN, so resets are reliable, and RotorHazard talks to race timers
+# over a plain serial port. USB-Serial/JTAG stays secondary so the same image
+# still prints on the USB cable.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=y
+
+# Meter image (no video pipeline).
+CONFIG_C5VRX_RSSI_METER=y
+CONFIG_C5VRX_PHY_PHASE_TAP_PROBE=n
+CONFIG_C5VRX_BS_RELATIVE_WORKER_PROBE=n
+CONFIG_C5VRX_BS_RELATIVE_MIDDLE_PROBE=n
+CONFIG_C5VRX_BS_ADDCTIA_PROBE=n
+CONFIG_C5VRX_PHASE8_HR_LIVE_TEST=n
+CONFIG_C5VRX_PHASE5_360_LIVE=n
+CONFIG_C5VRX_RSSI_DAC_ENABLE=n

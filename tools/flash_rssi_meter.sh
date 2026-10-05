@@ -25,7 +25,17 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-PORT="/dev/cu.usbmodem1101"
+# Port auto-detect: a board with a real USB-to-UART bridge enumerates as
+# /dev/cu.usbserial-*; the built-in USB-Serial/JTAG enumerates as
+# /dev/cu.usbmodem*. Prefer the bridge, since that is the path with reliably
+# wired DTR/RTS (BOOT and EN) and the one RotorHazard expects for a race timer.
+PORT="${ESPTOOL_PORT_OVERRIDE:-}"
+if [ -z "$PORT" ]; then
+  for p in /dev/cu.usbserial-* /dev/cu.usbmodem*; do
+    if [ -e "$p" ]; then PORT="$p"; break; fi
+  done
+fi
+[ -n "$PORT" ] || PORT="/dev/cu.usbserial-110"
 NO_BUILD=0
 MANUAL=0
 for arg in "$@"; do
@@ -59,6 +69,13 @@ flash() {
 if [ "$MANUAL" -eq 1 ]; then
   echo ">> ROM entry: manual (assumed)"
   flash no_reset
+elif [ -e "$PORT" ] && case "$PORT" in /dev/cu.usbserial-*) true ;; *) false ;; esac; then
+  # A real USB-to-UART bridge has DTR and RTS physically wired to BOOT and EN,
+  # so a normal reset reliably lands in download mode and no external circuit
+  # is needed. This is why the UART port on the devkit never needed a manual
+  # reset, while the built-in USB-Serial/JTAG path did.
+  echo ">> ROM entry: hardware DTR/RTS (USB-to-UART bridge)"
+  flash default_reset
 elif python3 - "$PORT" <<'PYEOF'
 import serial, sys, time
 try:
@@ -72,7 +89,7 @@ except Exception:
     sys.exit(1)
 sys.exit(0)
 PYEOF
-; then
+then
   echo ">> ROM entry: X sent; trying no_reset connect"
   sleep 2
   if flash no_reset; then :; else
