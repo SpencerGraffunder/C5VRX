@@ -406,6 +406,57 @@ void rf_dump_agc_regs(void)
     printf("\n");
 }
 
+/* Which PHY registers actually follow the received signal?
+ *
+ * phy_get_rssi() is a single opaque vendor accessor. When it stops working it
+ * is guesswork whether the number is gone entirely or only moved into a
+ * different field. This walks the whole PHY block repeatedly and reports only
+ * the registers whose value changes, with the range each one moved through.
+ * Toggle the transmitter while it runs: a register that tracks signal strength
+ * is a usable RSSI source whether or not the vendor accessor exposes it. */
+#define RF_PROBE_REG_BASE  0x600A7000u
+#define RF_PROBE_REG_WORDS 128u   /* 0x600A7000 .. 0x600A71FC */
+
+void rf_probe_signal_regs(int rounds, int round_ms)
+{
+    static uint32_t first[RF_PROBE_REG_WORDS];
+    static uint32_t lo[RF_PROBE_REG_WORDS];
+    static uint32_t hi[RF_PROBE_REG_WORDS];
+
+    if (rounds < 2) rounds = 2;
+    if (rounds > 2000) rounds = 2000;
+    if (round_ms < 1) round_ms = 1;
+
+    for (int r = 0; r < rounds; r++) {
+        for (uint32_t i = 0; i < RF_PROBE_REG_WORDS; i++) {
+            uint32_t v = REG32(RF_PROBE_REG_BASE + i * 4u);
+            if (r == 0) {
+                first[i] = v;
+                lo[i] = v;
+                hi[i] = v;
+            } else {
+                if (v < lo[i]) lo[i] = v;
+                if (v > hi[i]) hi[i] = v;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS((uint32_t)round_ms));
+    }
+
+    int moved = 0;
+    printf("REGPROBE rounds=%d window=0x%08lx..0x%08lx",
+           rounds, (unsigned long)RF_PROBE_REG_BASE,
+           (unsigned long)(RF_PROBE_REG_BASE + (RF_PROBE_REG_WORDS - 1u) * 4u));
+    for (uint32_t i = 0; i < RF_PROBE_REG_WORDS; i++) {
+        if (lo[i] == hi[i]) continue;
+        printf("\nMOVED 0x%08lx first=%08lx lo=%08lx hi=%08lx",
+               (unsigned long)(RF_PROBE_REG_BASE + i * 4u),
+               (unsigned long)first[i], (unsigned long)lo[i],
+               (unsigned long)hi[i]);
+        moved++;
+    }
+    printf("\nREGPROBE moved=%d of %u\n", moved, (unsigned)RF_PROBE_REG_WORDS);
+}
+
 esp_err_t rf_start(void)
 {
     /* NVS is required by ESP-IDF Wi-Fi/PHY initialization. */
@@ -501,8 +552,22 @@ esp_err_t rf_start(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    /* Route MODEM_DIAG to PARLIO RX GPIO pins. */
+    /* Route MODEM_DIAG to PARLIO RX GPIO pins.
+     *
+     * The RSSI meter build must NOT do this. GPIO10 is simultaneously an IQ lane
+     * pin and the auto-download arm pin for the external BOOT circuit
+     * (diode + capacitor + 50k + MOSFET). Connecting a MODEM_DIAG output to it
+     * lets an RF diagnostic signal drive the MOSFET gate, so BOOT is held low
+     * across a reset and the board falls into download mode instead of booting
+     * the app - the "keeps needing a reset" failure. The meter has no PARLIO RX
+     * path, so this routing is unnecessary there; the arm GPIO stays under the
+     * meter's own control.
+     */
+#ifndef CONFIG_C5VRX_RSSI_METER
     if ((err = route_modem_iq()) != ESP_OK) return err;
+#else
+    (void)route_modem_iq;
+#endif
 
     /* Un-gate modem ADC clock and force continuous sampling. */
     rf_enable_continuous_modem();
@@ -756,6 +821,19 @@ bool rf_try_get_wideband_rssi_dbm(int *dbm)
     return true;
 }
 
+/* Raw, unvalidated PHY reads. The range check above hides exactly the evidence
+ * a bring-up session needs: when the detector is dead the caller only knows
+ * "rejected", not what the PHY actually reported. */
+int rf_raw_phy_rssi(void)
+{
+    return phy_get_rssi ? phy_get_rssi() : RF_RAW_SYM_MISSING;
+}
+
+int rf_raw_phy_noise_floor(void)
+{
+    return phy_get_noise_floor ? phy_get_noise_floor() : RF_RAW_SYM_MISSING;
+}
+
 const arc_gain_table_t *rf_get_arc_gain_table(void)
 {
     return &s_arc_gain_table;
@@ -784,6 +862,32 @@ size_t rf_get_channel_index(void)
 size_t rf_get_channel_count(void)
 {
     return FPV_BAND_COUNT * 8u;
+}
+
+const fpv_channel_t *rf_get_channel_at(size_t index)
+{
+    if (index >= FPV_BAND_COUNT * 8u) {
+        return NULL;
+    }
+    return &s_fpv_channels[index / 8u][index % 8u];
+}
+
+const fpv_channel_t *rf_find_channel_by_freq(uint16_t freq_mhz, int tol_mhz)
+{
+    const fpv_channel_t *best = NULL;
+    int best_diff = 0x7FFF;
+    for (int b = 0; b < FPV_BAND_COUNT; ++b) {
+        for (int i = 0; i < 8; ++i) {
+            const fpv_channel_t *ch = &s_fpv_channels[b][i];
+            int d = (int)ch->freq_mhz - (int)freq_mhz;
+            if (d < 0) d = -d;
+            if (d <= tol_mhz && d < best_diff) {
+                best = ch;
+                best_diff = d;
+            }
+        }
+    }
+    return best;
 }
 
 fpv_band_t rf_get_current_band(void)

@@ -12,6 +12,26 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 
+def build_flash_size(build_dir: Path) -> str:
+    """Flash size stamped by the build, never a hardcoded one.
+
+    The bootloader/app image header must match the board's real flash size: an
+    8MB-stamped bootloader on a 4MB devkit asserts in esp_flash_spi_init at
+    boot and the board crash-loops until it is power-cycled. Hardcoding 8MB
+    here re-stamped a 4MB build back to 8MB and caused exactly that.
+    """
+    try:
+        text = (build_dir / "config" / "sdkconfig.h").read_text()
+    except OSError:
+        return "keep"
+    for line in text.splitlines():
+        if line.startswith("#define CONFIG_ESPTOOLPY_FLASHSIZE "):
+            value = line.split(None, 2)[2].strip().strip('"')
+            if value:
+                return value
+    return "keep"
+
+
 def main(port: str, build_dir: Path) -> None:
     files = [build_dir / "bootloader" / "bootloader.bin",
              build_dir / "partition_table" / "partition-table.bin",
@@ -29,7 +49,7 @@ def main(port: str, build_dir: Path) -> None:
         "--after", "watchdog_reset",
         "write_flash",
         "--flash-mode", "dio",
-        "--flash-size", "8MB",
+        "--flash-size", build_flash_size(build_dir),
         "--flash-freq", "80m",
         "0x2000", str(files[0]),
         "0x8000", str(files[1]),

@@ -116,6 +116,13 @@ void rf_get_native_agc_state(rf_native_agc_state_t *state);
  */
 bool rf_try_get_noise_floor_dbm(int *dbm);
 bool rf_try_get_wideband_rssi_dbm(int *dbm);
+
+/* Diagnosis only: the unvalidated vendor accessor value, or this sentinel when
+ * the vendor symbol is not linked at all. */
+#define RF_RAW_SYM_MISSING (-999)
+int rf_raw_phy_rssi(void);
+int rf_raw_phy_noise_floor(void);
+void rf_probe_signal_regs(int rounds, int round_ms);
 const arc_gain_table_t *rf_get_arc_gain_table(void);
 uint8_t rf_get_arc_survival_gain(void);
 /* Changes after every successful PHY init/channel retune and lets the ARC
@@ -143,6 +150,8 @@ typedef enum {
 const fpv_channel_t *rf_get_current_channel(void);
 size_t rf_get_channel_index(void);
 size_t rf_get_channel_count(void);
+const fpv_channel_t *rf_get_channel_at(size_t index); /* index = band*8+idx, or NULL */
+const fpv_channel_t *rf_find_channel_by_freq(uint16_t freq_mhz, int tol_mhz); /* nearest named FPV channel within tol_mhz, or NULL */
 esp_err_t rf_set_channel(size_t index);
 
 /**

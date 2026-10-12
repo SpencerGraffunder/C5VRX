@@ -18,7 +18,12 @@ set(c5vrx_sources
 
 if(CONFIG_C5VRX_RSSI_METER)
     # Standalone meter image: proven RF state only, no video pipeline.
-    set(c5vrx_sources "rssi_meter_main.c" "rf.c" "arc_phy.c")
+    set(c5vrx_sources
+        "rssi_meter_main.c"
+        "rf.c"
+        "arc_phy.c"
+        "rssi_signal.c"
+        "rh_node.c")
 endif()
 
 idf_component_register(
@@ -42,7 +47,9 @@ idf_component_register(
         heap
         hal
         esp_hw_support
+        esp_hal_gpio
         esp_driver_gptimer
+        esp_driver_uart
 )
 
 # Proven default plus opt-in experimental demod/output paths. The meter

@@ -9,39 +9,101 @@
  * because rf_start() arms the continuous-modem dump writer, which keeps
  * streaming into those banks in the background.
  *
- * Purpose: drone race timer proximity sensing. The receiver is tuned to a
- * fixed VTX frequency and reports how much RF power is in the channel, the
- * same job as the analog RSSI pin on a classic VRX. Video is deliberately
- * sacrificed; flash the normal firmware again for video.
+ * Purpose: drone race timer proximity sensing. The receiver reports how
+ * much RF power is in the tuned channel, the same job as the analog RSSI
+ * pin on a classic VRX. Video is deliberately sacrificed; flash the normal
+ * firmware again for video.
+ *
+ * Signal chain (see rssi_signal.h):
+ *   phy_get_rssi() (raw dBm, 1 kHz)
+ *     -> EMA low-pass (E)
+ *     -> calibration: dbLo -> 0, dbHi -> 255 (C)
+ *   The calibrated 0..255 value drives the analog output and the P:
+ *   stream field; the raw dBm stays on the line as R: for diagnostics.
+ *   Signal presence is the smoothed level a margin (A) above a learned
+ *   quiet baseline, with hysteresis, and a latched (frozen) reading can
+ *   never read as a signal (see the freshness rule in rssi_signal.h).
  *
  * Outputs:
- *   USB CDC, ~1 kHz line per sample:
- *       R:<rssi_dBm> NF:<noise_floor_dBm> G:<gain_idx> M:<0|1>
+ *   USB CDC or UART, ~1 kHz line per sample:
+ *       R:<rssi_dBm> NF:<noise_floor_dBm> G:<gain_idx> M:<0|1> P:<0..255> S:<0|1>
  *     M:0 = firmware forced gain (G valid), M:1 = native hardware AGC
  *     (G = -1, gain is hardware-owned). -127 means the PHY value was
- *     invalid/stale for that field.
+ *     invalid/stale for that field. P is the calibrated strength value;
+ *     S is the signal-present decision.
  *   6-bit analog DAC: the same D4..D9 resistor network as the video output,
- *     driven by static GPIO writes (no GDMA). RSSI dBm is mapped onto
- *     0..63 and clamped; V inverts the polarity.
+ *     driven by static GPIO writes (no GDMA). The calibrated 0..255 value
+ *     is mapped onto 0..63; V inverts the polarity.
  *
  * Commands:
  *   H      help
- *   T      one status line (frequency, mode, DAC range, polarity, paused)
+ *   T      one status line (frequency, mode, calibration, signal state)
  *   N      toggle native hardware AGC, persist to NVS, reboot
  *   S      fixed-gain sweep G15..G81 (forced mode only): the pre-gain /
  *          post-gain RSSI oracle. Restores the previous gain.
- *   F<mhz> retune to an arbitrary MHz inside the C5 5 GHz window
- *          (e.g. F5800). Same two-step path as FPV channel retunes: nearest
- *          public Wi-Fi center first, then the phy_set_freq() delta.
- *   V      invert DAC polarity (runtime)
- *   L      pause / resume the 1 kHz stream
+ *   F<mhz> retune to a frequency inside the C5 5 GHz window, e.g. F5800.
+ *          F R4 / F F4 also accepts a named FPV channel (snaps within 2 MHz).
+ *   SCAN [dwell_ms]  measure all 48 FPV channels, report the strongest,
+ *          restore the previous frequency.
+ *   CH <band><n>     tune to a named channel (CH R4). Both F and CH update
+ *          the boot frequency that P persists.
+ *   C               show the calibration (dbLo, dbHi)
+ *   C <lo> <hi>     set the dB levels that read as 0 and 255
+ *   C lo | C hi     use the current smoothed reading as the low / high end
+ *   E <alpha>       EMA smoothing, 0.01 to 1 (1 = off)
+ *   A [db]          signal-present margin over the learned baseline
+ *   R               forget the learned baseline and re-learn it
+ *   OUT <0..255> | OUT off   fix the analog output level (wiring test)
+ *   P               save the settings to NVS (boot frequency included)
+ *   D               restore default settings (in memory, not saved)
+ *   V               invert DAC polarity
+ *   L               pause / resume the 1 kHz stream
+ *   M               RotorHazard USB node mode (persist). In node mode the
+ *          port answers server polls only; M returns to the console. A
+ *          protocol command byte arriving on a console port switches to
+ *          node mode automatically.
+ *   B               reboot the meter (clean esp_restart; recovers a wedged
+ *          stream)
+ *   X               arm the external auto-download circuit and restart. The
+ *          circuit (see "Auto-download circuit" in docs/rssi-meter.md) is a
+ *          diode + 10 uF cap + 2N7000 MOSFET + 50k resistor that GPIO10
+ *          arms: the MOSFET then holds GPIO0 (BOOT) low ACROSS the restart,
+ *          so the ROM samples download mode and waits for esptool. The RC
+ *          discharges in ~1.5 s, so the NEXT reset (esptool's watchdog
+ *          finish, seconds later) sees the BOOT pull-up high and boots the
+ *          new app: no buttons, no host DTR/RTS dependency.
+ *          Without the hardware fitted, X degrades to a plain reboot.
+ *   Q [sec]         what the PHY really reports: raw accessor values, or a
+ *          seconds-long scan that lists only the receiver registers whose
+ *          value moved (toggle the transmitter while it runs)
+ *   Z [sec]         diagnostics: Wi-Fi frames seen, distinct RSSI values
+ *
+ * Settings persist in NVS (namespace c5vrx, key rssi_cfg): calibration,
+ * EMA, signal-present stage, DAC polarity, node mode, boot frequency.
+ * P saves, D resets the in-memory copy to defaults.
+ *
+ * Scheduling: the 1 kHz output task reads RSSI, shapes it through the
+ * signal stage, drives the analog output and feeds the node engine. The
+ * RF mutex serializes tuning between the console and diagnostics.
+ *
+ * History (2026-10-02): a pure-software self-download (drive GPIO0 low from
+ * the GPIO output latch + restart) was tried and proven NOT to work on the
+ * C5: the pad is sampled high at reset, so the chip always came back in the
+ * app. The host-side esptool usb_reset (DTR/RTS) path was proven flaky on
+ * the dev Mac: the kernel's RTS state decides whether the BOOT pin is held
+ * low at reset, and it is not deterministic. The external circuit above
+ * removes both dependencies.
  *
  * Invariants honoured: in native AGC mode every firmware gain write stays
  * refused at rf_set_rx_gain(); the DAC pin order and network are unchanged;
- * USB is the only consumer and nothing paces anything because no IQ
- * production exists in this image.
+ * USB and UART are both command inputs and the meter answers on the port a
+ * command arrived on.
  */
+#include <ctype.h>
+#include <math.h>
+#include <strings.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -49,9 +111,17 @@
 #include "heap_memory_layout.h"
 #include "driver/gpio.h"
 #include "esp_system.h"
+#include "esp_timer.h"
+#include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "nvs_flash.h"
+#include "soc/uart_pins.h"
+#include "driver/uart.h"
+#include "driver/usb_serial_jtag.h"
 #include "rf.h"
+#include "rssi_signal.h"
+#include "rh_node.h"
 
 /* The allocation selector disconnects BOTH 64 KiB dump banks from the CPU.
  * Same proven reservation as the capture-only meter; the background
@@ -62,91 +132,538 @@ extern char _bss_end;
 /* Race timer default center; F<mhz> retunes at runtime. */
 #define METER_BOOT_FREQ_MHZ  5800u
 
+/* C5 5 GHz receive window (channel 36 = 5180 MHz .. 177 = 5885 MHz). */
+#define METER_FREQ_MIN_MHZ   5180u
+#define METER_FREQ_MAX_MHZ   5885u
+
+/* Auto-download arm line (external circuit, docs/rssi-meter.md). GPIO10 is
+ * free: not a DAC pin (23/24/11/12/8/9), not USB (18/19), not flash (20/21),
+ * not a strapping pin (0/23/29/30/31). */
+#define METER_DOWNLOAD_ARM_GPIO  GPIO_NUM_10
+
+/* Meter operating gain. rf_start() leaves the C5VRX default (52) in place;
+ * the 2026-10-02 bench (4 MB DevKit, VTX 5800 MHz, fixed position) showed
+ * gain 52 sits in a high-gain stage whose noise floor (-60 dBm) equals the
+ * clamped on-signal level, i.e. zero detection margin. At 47 and below the
+ * signal reads 34 dB above the floor (signal ~-60, floor ~-94 dBm), which is
+ * the race-timer operating point. Re-calibrate with the S sweep per site. */
+#define METER_DEFAULT_GAIN   47u
+
+/* Node-mode defaults, used only until the server polls and writes its own
+ * per-node levels. On the 0..255 strength scale with the default -100..-40 dBm
+ * calibration, 120 is about -71 dBm and 100 about -76 dBm: above the measured
+ * quiet floor (~-90 dBm) and well below a close-range reading (~-45 dBm). */
+#define RH_NODE_ENTER_AT   120u
+#define RH_NODE_EXIT_AT    100u
+
 /* Six-bit video DAC. Same pin order as the video path (byte bit i -> pin i,
  * PARLIO LSB-first): never change the order, the physical
  * 8.2k/3.9k/2k/1k/470R/240R + 200R network is wired to exactly these pins. */
 static const gpio_num_t s_dac_gpio[6] = {23, 24, 11, 12, 8, 9};
 
-/* RSSI -> DAC code window. Tune after the first bench session; the raw dBm
- * is always on USB so the mapping can be adjusted from data. */
-#define RSSI_DAC_DBM_LO   (-100)
-#define RSSI_DAC_DBM_HI   (-40)
+/* Pins the meter is actually allowed to drive. A ladder pin that is also the
+ * console UART pin is excluded (see the guard in app_main), otherwise the
+ * meter fights the serial link that is talking to it. */
+static bool s_dac_active[6];
 
-static volatile bool s_stream_paused;
-static volatile bool s_dac_invert;
-static volatile int s_meter_gain = 52; /* rf_start() forced-gain default */
+/* Meter state, reported on T. */
+typedef enum {
+    METER_STATE_BOOT = 0,
+    METER_STATE_IDLE = 1,
+    METER_STATE_TUNING = 2,
+    METER_STATE_TRACKING = 3,
+    METER_STATE_FAULT = 4,
+} meter_state_t;
 
-static void dac_write(uint8_t code)
+/* Persisted settings (NVS c5vrx/rssi_cfg). */
+#define METER_CFG_MAGIC    0x4335524Du /* "C5RM" */
+/* Version 4: the signal-present stage (margin, hysteresis, floor, fresh,
+ * baseline learning rate) without the shaping knobs removed in the 2026-10-06
+ * cleanup. Any older blob is rejected and defaults are used. */
+#define METER_CFG_VERSION  4u
+typedef struct {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t boot_mhz;      /* 0 = METER_BOOT_FREQ_MHZ */
+    float db_lo;            /* calibrated 0 dBm end */
+    float db_hi;            /* calibrated 255 dBm end */
+    float ema_alpha;
+    uint8_t dac_invert;
+    /* Signal-present stage. */
+    float margin_db;
+    float hysteresis_db;
+    float floor_db;
+    float baseline_alpha;
+    uint32_t fresh_ms;
+    /* RotorHazard USB node mode. When on, the port speaks the RotorHazard
+     * request/response protocol instead of the 1 kHz text stream, so nothing
+     * else may be written to it. M toggles it at runtime and persists here. */
+    uint8_t node_mode;
+    uint32_t min_lap_ms;
+} meter_cfg_t;
+
+static void meter_cfg_defaults(meter_cfg_t *cfg)
 {
-    for (unsigned i = 0u; i < 6u; ++i) {
-        gpio_set_level(s_dac_gpio[i], (code >> i) & 1u);
+    cfg->magic = METER_CFG_MAGIC;
+    cfg->version = METER_CFG_VERSION;
+    cfg->boot_mhz = 0;
+    cfg->db_lo = -100.0f;   /* matches the original DAC window */
+    cfg->db_hi = -40.0f;
+    cfg->ema_alpha = 1.0f;  /* off by default */
+    cfg->dac_invert = 0;
+    /* Signal present = smoothed reading at least margin_db above the learned
+     * quiet baseline, clearing hysteresis_db below that point. The margin is
+     * the bench separation measured on the DevKit (signal ~-45, quiet floor
+     * ~-90 dBm at gain 47), reduced to 12 dB so a distant drone still trips
+     * it while noise does not. */
+    cfg->margin_db = 12.0f;
+    cfg->hysteresis_db = 6.0f;
+    /* Below this the reading is physically impossible for a 40 MHz channel
+     * (kTB floor ~ -98 dBm), so it means the detector is not measuring. */
+    cfg->floor_db = -105.0f;
+    cfg->baseline_alpha = 0.002f;   /* ~500 ms time constant at 1 kHz */
+    /* A reading unchanged for this long means no carrier: with the VTX off
+     * the register held one value for 60 s, with it on the value moved
+     * constantly. */
+    cfg->fresh_ms = 1000u;
+    /* Node mode is the default: RotorHazard polls the port and the meter
+     * answers as a node. Press M for the human console instead. */
+    cfg->node_mode = 1;
+    /* Guard against threshold bounce producing a second lap for the same
+     * pass (same value the proven NuclearCounter node uses). */
+    cfg->min_lap_ms = 3000u;
+}
+
+static bool meter_cfg_valid(const meter_cfg_t *cfg)
+{
+    if (cfg->magic != METER_CFG_MAGIC || cfg->version != METER_CFG_VERSION) {
+        return false;
+    }
+    if (cfg->db_lo < -140.0f || cfg->db_lo > -10.0f ||
+        cfg->db_hi < -100.0f || cfg->db_hi > 10.0f ||
+        cfg->db_hi <= cfg->db_lo + 5.0f) {
+        return false;
+    }
+    if (cfg->ema_alpha <= 0.0f || cfg->ema_alpha > 1.0f) {
+        return false;
+    }
+    if (cfg->margin_db <= 0.0f || cfg->margin_db > 60.0f ||
+        cfg->hysteresis_db < 0.0f || cfg->hysteresis_db > cfg->margin_db ||
+        cfg->floor_db < -140.0f || cfg->floor_db > -20.0f ||
+        cfg->baseline_alpha <= 0.0f || cfg->baseline_alpha > 1.0f ||
+        cfg->fresh_ms == 0u || cfg->fresh_ms > 10000u) {
+        return false;
+    }
+    if (cfg->boot_mhz != 0u &&
+        (cfg->boot_mhz < METER_FREQ_MIN_MHZ || cfg->boot_mhz > METER_FREQ_MAX_MHZ)) {
+        return false;
+    }
+    if (cfg->min_lap_ms > 60000u) {
+        return false;
+    }
+    return true;
+}
+
+static void meter_cfg_load(meter_cfg_t *cfg)
+{
+    /* Defaults must be applied here, not by the caller: an absent or invalid
+     * NVS blob returns early, and a zeroed global would otherwise reach the
+     * signal stage as cal 0..0 dB (the meter ran like that until this was
+     * fixed). */
+    meter_cfg_defaults(cfg);
+    nvs_handle_t h;
+    if (nvs_open("c5vrx", NVS_READONLY, &h) != ESP_OK) {
+        return; /* keep defaults */
+    }
+    size_t len = sizeof(*cfg);
+    esp_err_t err = nvs_get_blob(h, "rssi_cfg", cfg, &len);
+    nvs_close(h);
+    if (err != ESP_OK || len != sizeof(*cfg) || !meter_cfg_valid(cfg)) {
+        meter_cfg_defaults(cfg);
     }
 }
 
-static uint8_t rssi_to_code(int dbm)
+static bool meter_cfg_save(const meter_cfg_t *cfg)
 {
-    int code = (dbm - RSSI_DAC_DBM_LO) * 63 / (RSSI_DAC_DBM_HI - RSSI_DAC_DBM_LO);
-    if (code < 0) code = 0;
-    if (code > 63) code = 63;
-    if (s_dac_invert) code = 63 - code;
-    return (uint8_t)code;
+    nvs_handle_t h;
+    if (nvs_open("c5vrx", NVS_READWRITE, &h) != ESP_OK) {
+        return false;
+    }
+    esp_err_t err = nvs_set_blob(h, "rssi_cfg", cfg, sizeof(*cfg));
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err == ESP_OK;
 }
+
+static meter_cfg_t s_cfg;
+static rssi_signal_t s_sig;
+static SemaphoreHandle_t s_rf_mutex; /* serializes tuning and diagnostics */
+static volatile bool s_stream_paused;
+static volatile bool s_last_signal;   /* last reported pass event */
+static volatile bool s_dac_invert;
+static volatile int s_meter_gain = 52; /* rf_start() forced-gain default */
+static volatile int s_force_counts = -1; /* OUT command wiring test */
+static volatile uint8_t s_state = METER_STATE_BOOT;
+static volatile uint16_t s_tuned_mhz = 0;
+static volatile bool s_freq_supported = true;
+
+/* RotorHazard USB node state. The 1 kHz task feeds samples; the console task
+ * runs the protocol. Both touch the node, so it is mutex-protected. */
+static rh_node_t s_node;
+static SemaphoreHandle_t s_node_mutex;
+static volatile bool s_node_mode;
+static volatile bool s_quiet;   /* suppress console prints while node mode owns the port */
+
+static void node_feed(uint8_t counts, uint32_t now_ms);
+static void meter_arm_download_and_restart(void);
+static void meter_set_frequency(uint16_t mhz);
+
+static void dac_write(uint8_t code)
+{
+#ifdef CONFIG_C5VRX_RSSI_DAC_ENABLE
+    for (unsigned i = 0u; i < 6u; ++i) {
+        if (!s_dac_active[i]) {
+            continue;
+        }
+        gpio_set_level(s_dac_gpio[i], (code >> i) & 1u);
+    }
+#endif
+}
+
+/* Calibrated 0..255 strength -> 6-bit DAC code (0..63). With the default
+ * calibration (-100..-40 dBm) this reproduces the original dBm mapping. */
+static uint8_t counts_to_code(uint8_t counts)
+{
+    uint8_t code = (uint8_t)((uint16_t)counts * 63u / 255u);
+    if (s_dac_invert) {
+        code = 63u - code;
+    }
+    return code;
+}
+
+/* Feed one calibrated strength sample to the node engine. Called from the
+ * 1 kHz task; the console task reads the same state when building a reply. */
+static void node_feed(uint8_t counts, uint32_t now_ms)
+{
+    if (!s_node_mutex) {
+        return;
+    }
+    xSemaphoreTake(s_node_mutex, portMAX_DELAY);
+    rh_node_on_sample(&s_node, counts, now_ms);
+    xSemaphoreGive(s_node_mutex);
+}
+
+/* ---- Routed console I/O -------------------------------------------------
+ * The meter is reachable over two physical ports and both are legitimate in
+ * the timer role:
+ *   - UART0: the board's USB-UART bridge, or a plain serial lead from a timer
+ *   - the built-in USB-Serial/JTAG CDC port: the board's USB socket
+ * A RotorHazard server reads exactly payload+checksum from the port it wrote
+ * to, so a reply must leave by the port it was asked on; replying on the other
+ * port breaks that server's framing. meter_getchar() records which port a byte
+ * arrived on and every write below follows it, so a command typed on either
+ * cable is answered on that same cable. This also removes the old trap where
+ * the whole console silently lived on whichever port CONFIG_ESP_CONSOLE picked.
+ */
+typedef enum {
+    MPORT_PRIMARY = 0,   /* whatever CONFIG_ESP_CONSOLE selects (stdout) */
+    MPORT_UART = 1,
+    MPORT_USBJTAG = 2,
+} mport_t;
+
+static mport_t s_out_port = MPORT_PRIMARY;
+static bool s_uart_rx_ready = false;
+static bool s_usbjtag_rx_ready = false;
+
+static void meter_write_bytes(const uint8_t *b, int len)
+{
+    if (len <= 0) {
+        return;
+    }
+    if (s_out_port == MPORT_UART && s_uart_rx_ready) {
+        uart_write_bytes(UART_NUM_0, (const char *)b, (size_t)len);
+        return;
+    }
+    if (s_out_port == MPORT_USBJTAG && s_usbjtag_rx_ready) {
+        usb_serial_jtag_write_bytes(b, (size_t)len, 0);
+        return;
+    }
+    fwrite(b, 1, (size_t)len, stdout);
+}
+
+static void meter_flush(void)
+{
+    if (s_out_port == MPORT_USBJTAG && s_usbjtag_rx_ready) {
+        usb_serial_jtag_wait_tx_done(pdMS_TO_TICKS(200));
+        return;
+    }
+    fflush(stdout);
+}
+
+static int meter_printf(const char *fmt, ...)
+{
+    char small[256];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(small, sizeof(small), fmt, ap);
+    va_end(ap);
+    if (n <= 0) {
+        return n;
+    }
+    if (n < (int)sizeof(small)) {
+        meter_write_bytes((const uint8_t *)small, n);
+        return n;
+    }
+    /* Long blocks (help text) must not be silently truncated. */
+    char *big = malloc((size_t)n + 1u);
+    if (!big) {
+        meter_write_bytes((const uint8_t *)small, (int)sizeof(small) - 1);
+        return n;
+    }
+    va_start(ap, fmt);
+    vsnprintf(big, (size_t)n + 1u, fmt, ap);
+    va_end(ap);
+    meter_write_bytes((const uint8_t *)big, n);
+    free(big);
+    return n;
+}
+
+/* Receive-liveness watchdog state (see meter_output_task). */
+#define RX_STALE_WARN_MS 5000u
+static volatile int s_rxwatch_raw = -128;
+static volatile uint32_t s_rxwatch_change_ms;
+static volatile uint32_t s_rxwatch_warn_ms;
+static volatile uint32_t s_rxwatch_nf_bad;
+static volatile uint32_t s_rxwatch_total;
 
 static void meter_output_task(void *arg)
 {
+    (void)arg;
     for (;;) {
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        int rssi = -127;
+        int nf = -127;
+        bool rssi_ok = false;
+        bool nf_ok = false;
+
         if (!s_stream_paused) {
-            int rssi = -127;
-            int nf = -127;
-            bool rssi_ok = rf_try_get_wideband_rssi_dbm(&rssi);
-            bool nf_ok = rf_try_get_noise_floor_dbm(&nf);
+            rssi_ok = rf_try_get_wideband_rssi_dbm(&rssi);
+            nf_ok = rf_try_get_noise_floor_dbm(&nf);
             if (rssi_ok) {
-                bool native = rf_native_agc_active();
-                printf("R:%d NF:%d G:%d M:%d\n",
-                       rssi,
-                       nf_ok ? nf : -127,
-                       native ? -1 : s_meter_gain,
-                       native ? 1 : 0);
-                dac_write(rssi_to_code(rssi));
+                rssi_signal_on_sample(&s_sig, (float)rssi, now_ms);
             }
+        }
+        rssi_signal_tick(&s_sig, now_ms);
+
+        /* Receive-liveness watchdog.
+         *
+         * This meter can print a perfect 1 kHz stream while the PHY detector
+         * is dead: measured on device, the raw RSSI sat on one value for the
+         * whole window, the noise floor read invalid, and a promiscuous-mode
+         * frame count stayed at zero even when tuned onto a nearby 802.11ax
+         * access point reporting -49 dBm. A lap timer fed by a frozen RSSI
+         * would fire on every lap or none, so the meter refuses to hide that
+         * state behind a plausible-looking number. */
+        if (rssi_ok && rssi != s_rxwatch_raw) {
+            s_rxwatch_raw = rssi;
+            s_rxwatch_change_ms = now_ms;
+        }
+        s_rxwatch_total++;
+        if (!nf_ok) s_rxwatch_nf_bad++;
+        uint32_t frozen_ms = now_ms - s_rxwatch_change_ms;
+        if (!s_node_mode && !s_stream_paused &&
+            frozen_ms > RX_STALE_WARN_MS &&
+            now_ms - s_rxwatch_warn_ms > RX_STALE_WARN_MS) {
+            s_rxwatch_warn_ms = now_ms;
+            meter_printf("! RX STALE raw RSSI held at %d dBm for %u ms "
+                   "(noise floor invalid %u/%u) - the PHY detector is not "
+                   "updating, so these readings are not measurements\n",
+                   s_rxwatch_raw, (unsigned)frozen_ms,
+                   (unsigned)s_rxwatch_nf_bad, (unsigned)s_rxwatch_total);
+        }
+
+        /* TUNING -> TRACKING once the signal stage has a post-settle reading. */
+        if (s_state == METER_STATE_TUNING && rssi_signal_valid(&s_sig)) {
+            s_state = METER_STATE_TRACKING;
+        }
+
+        uint8_t p = (s_force_counts >= 0) ? (uint8_t)s_force_counts
+                                          : rssi_signal_counts(&s_sig);
+        dac_write(counts_to_code(p));
+        node_feed(p, now_ms);
+
+        /* Pass event: printed once per transition, so a timer or a log can
+         * see "drone in range" without re-deriving a threshold from the
+         * stream. Rare, so it never disturbs the 1 kHz cadence. Suppressed
+         * in node mode: the port must carry only protocol replies. */
+        bool sig = rssi_signal_signal_present(&s_sig);
+        if (sig != s_last_signal) {
+            s_last_signal = sig;
+            if (!s_node_mode) {
+                meter_printf("EVENT %s f=%u sig=%.1f dB base=%.1f\n",
+                       sig ? "present" : "clear", s_tuned_mhz,
+                       rssi_signal_smoothed_db(&s_sig),
+                       rssi_signal_baseline_db(&s_sig));
+            }
+        }
+
+        if (!s_stream_paused && rssi_ok && !s_node_mode) {
+            bool native = rf_native_agc_active();
+            meter_printf("R:%d NF:%d G:%d M:%d P:%u S:%d\n",
+                   rssi,
+                   nf_ok ? nf : -127,
+                   native ? -1 : s_meter_gain,
+                   native ? 1 : 0,
+                   (unsigned)p,
+                   sig ? 1 : 0);
         }
         vTaskDelay(pdMS_TO_TICKS(1)); /* ~1 kHz; FreeRTOS tick = 1 ms */
     }
 }
 
+/* ---- Tuning (console; serialized by s_rf_mutex) ---- */
+static esp_err_t meter_tune(uint16_t mhz, uint32_t now_ms)
+{
+    s_tuned_mhz = mhz;
+    s_freq_supported = (mhz >= METER_FREQ_MIN_MHZ && mhz <= METER_FREQ_MAX_MHZ);
+    xSemaphoreTake(s_rf_mutex, portMAX_DELAY);
+    esp_err_t err;
+    if (!s_freq_supported) {
+        /* A channel the C5 can't receive: accept the command, but report no
+         * signal. */
+        err = ESP_ERR_NOT_SUPPORTED;
+    } else {
+        err = rf_set_frequency_mhz(mhz);
+    }
+    xSemaphoreGive(s_rf_mutex);
+    rssi_signal_on_tune(&s_sig, now_ms);
+    s_state = (err == ESP_OK) ? METER_STATE_TUNING
+            : (err == ESP_ERR_NOT_SUPPORTED) ? METER_STATE_TRACKING
+                                              : METER_STATE_FAULT;
+    return err;
+}
+
+/* ---- Console ---- */
 static void meter_help(void)
 {
-    printf("RSSI_METER commands:\n"
+    meter_printf("RSSI_METER commands:\n"
            " H   this help\n"
            " T   status line\n"
            " N   toggle native HW AGC (persist, reboot)\n"
            " S   fixed-gain sweep G15..G81 (forced mode only, pre/post-gain oracle)\n"
-           " F<mhz>  retune, 5180-5885, e.g. F5800\n"
+           " F<mhz>|F R4  retune, 5180-5885, or a named FPV channel\n"
+           " SCAN [ms]  walk every FPV channel, report the strongest (500 ms dwell)\n"
+           "            (one optional argument only: dwell in ms, 20..1000)\n"
+           " CH R4       tune to a named FPV channel\n"
+           " C [lo hi]   show / set calibration dB (or 'C lo' / 'C hi')\n"
+           " E <alpha>   EMA smoothing 0.01..1 (1 = off)\n"
+           " A [db]      signal-present margin over learned baseline (default 12)\n"
+           " R           forget the learned baseline and re-learn it\n"
+           " OUT n|off   fix analog output 0..255 (wiring test)\n"
+           " Q [sec]  what the PHY really reports: raw values, or a register"
+           " scan that lists only the registers which move\n"
+           " Z [sec]  diagnostics: Wi-Fi frames seen, RSSI distinct values\n"
+           " P   save settings to NVS | D defaults (not saved)\n"
            " V   invert DAC polarity\n"
-           " L   pause/resume 1 kHz stream\n");
+           " L   pause/resume 1 kHz stream\n"
+           " M   RotorHazard USB node mode (persist)\n"
+           " B   reboot the meter\n"
+           " X   arm external auto-download circuit, then restart (for flashing)\n");
+}
+
+static const char *state_name(uint8_t s)
+{
+    switch (s) {
+    case METER_STATE_BOOT: return "BOOT";
+    case METER_STATE_IDLE: return "IDLE";
+    case METER_STATE_TUNING: return "TUNING";
+    case METER_STATE_TRACKING: return "TRACKING";
+    case METER_STATE_FAULT: return "FAULT";
+    }
+    return "?";
 }
 
 static void meter_status(void)
 {
-    printf("ST f:%u mode:%s dac:%d..%d dBm pol:%s paused:%d gain:%d\n",
-           rf_get_frequency_mhz(),
+    const fpv_channel_t *ch = rf_find_channel_by_freq(s_tuned_mhz, 0);
+    meter_printf("ST f:%u%s mode:%s state:%s cal:%.0f..%.0f dB ema:%.2f "
+           "sig:%d/%.0f dB base:%.1f fresh:%d dac_pol:%s "
+           "paused:%d gain:%d\n",
+           s_tuned_mhz, ch ? ch->name : "",
            rf_native_agc_active() ? "native_agc" : "forced",
-           RSSI_DAC_DBM_LO, RSSI_DAC_DBM_HI,
+           state_name(s_state),
+           s_sig.cfg.db_lo, s_sig.cfg.db_hi,
+           s_sig.cfg.ema_alpha,
+           rssi_signal_signal_present(&s_sig) ? 1 : 0,
+           s_sig.cfg.margin_db,
+           rssi_signal_baseline_db(&s_sig),
+           rssi_signal_fresh(&s_sig) ? 1 : 0,
            s_dac_invert ? "inverted" : "normal",
            s_stream_paused ? 1 : 0,
            s_meter_gain);
+    meter_printf("CONSOLE uart:%s usbjtag:%s reply_to:%s\n",
+           s_uart_rx_ready ? "ready" : "none",
+           s_usbjtag_rx_ready ? "ready" : "none",
+           s_out_port == MPORT_UART ? "uart" :
+           (s_out_port == MPORT_USBJTAG ? "usbjtag" : "primary"));
+    meter_printf("RX raw:%d nf_invalid:%u/%u phy_raw rssi:%d nf:%d\n",
+           s_rxwatch_raw, (unsigned)s_rxwatch_nf_bad, (unsigned)s_rxwatch_total,
+           rf_raw_phy_rssi(), rf_raw_phy_noise_floor());
+    meter_printf("NODE mode:%s enter:%d exit:%d minlap:%lu lap:%d current:%d peak:%d nadir:%d "
+           "laps:%lu reads:%lu errors:%lu\n",
+           s_node_mode ? "rotorhazard" : "console",
+           s_node.enter_at, s_node.exit_at,
+           (unsigned long)s_node.min_lap_ms, s_node.lap_id,
+           s_node.current, s_node.node_peak, s_node.node_nadir,
+           (unsigned long)s_node.laps_recorded,
+           (unsigned long)s_node.reads, (unsigned long)s_node.errors);
+}
+
+/* One received byte while node mode owns the port. The reply is written
+ * immediately: the server reads exactly payload + checksum bytes with a
+ * 250 ms timeout, so nothing else may be printed on this path. */
+static void node_handle_byte(uint8_t c)
+{
+    uint8_t out[24];
+    int len = 0;
+    uint16_t pending = 0;
+    bool fp = false, boot = false;
+
+    xSemaphoreTake(s_node_mutex, portMAX_DELAY);
+    len = rh_node_handle_byte(&s_node, c, out);
+    fp = s_node.freq_pending;
+    pending = s_node.pending_freq_mhz;
+    boot = s_node.bootloader_pending;
+    s_node.freq_pending = false;
+    s_node.bootloader_pending = false;
+    xSemaphoreGive(s_node_mutex);
+
+    if (len > 0) {
+        meter_write_bytes(out, len);
+        meter_flush();
+    }
+
+    /* Actions after the reply, so a retune never delays a checksum. */
+    if (fp) {
+        meter_set_frequency(pending);
+    }
+    if (boot) {
+        meter_arm_download_and_restart();
+    }
 }
 
 static void meter_gain_sweep(void)
 {
     if (rf_native_agc_active()) {
-        printf("SWEEP REFUSED reason=native_agc_active gain_writes_must_stay_refused\n");
+        meter_printf("SWEEP REFUSED reason=native_agc_active gain_writes_must_stay_refused\n");
         return;
     }
     /* Same spread as the video-firmware RSSI oracle (serial R). */
     static const uint8_t gains[] = {15u, 31u, 47u, 63u, 79u, 81u};
     const int restore = s_meter_gain;
-    printf("SWEEP start f=%u restore_g=%d\n", rf_get_frequency_mhz(), restore);
+    meter_printf("SWEEP start f=%u restore_g=%d\n", s_tuned_mhz, restore);
     for (unsigned i = 0u; i < sizeof(gains) / sizeof(gains[0]); ++i) {
         rf_set_rx_gain(true, gains[i]);
         s_meter_gain = gains[i];
@@ -155,32 +672,547 @@ static void meter_gain_sweep(void)
         int nf = -127;
         bool rssi_ok = rf_try_get_wideband_rssi_dbm(&rssi);
         bool nf_ok = rf_try_get_noise_floor_dbm(&nf);
-        printf("SWEEP G:%u R:%d NF:%d\n",
+        meter_printf("SWEEP G:%u R:%d NF:%d\n",
                (unsigned)gains[i], rssi_ok ? rssi : -127, nf_ok ? nf : -127);
     }
     rf_set_rx_gain(true, (uint8_t)restore);
     s_meter_gain = restore;
     vTaskDelay(pdMS_TO_TICKS(150));
-    printf("SWEEP done restored G:%d\n", restore);
+    meter_printf("SWEEP done restored G:%d\n", restore);
 }
 
-static void meter_set_frequency(const char *tok)
+/* Console RX through the UART driver, not the ROM "basic" console path.
+ *
+ * Root cause (bench, 2026-10-04): on this C5 devkit the app-level ROM console
+ * read never returns data - the meter could print but never hear. The physical
+ * RX path is healthy (esptool reaches the ROM download mode over the same
+ * wires), so only the ROM getchar() implementation is unusable from an app.
+ * Installing the UART0 driver makes RX go through the hardware RX FIFO, which
+ * works. Keep this: without it the meter can talk but cannot listen, and every
+ * serial command (including X, the no-button download-mode arm) is dead.
+ *
+ * The driver must be installed on the same pins the ROM console uses
+ * (U0RXD_GPIO_NUM / U0TXD_GPIO_NUM); meter_getchar() is the only reader, so the
+ * VFS console and the driver never compete for the same byte.
+ */
+
+static void meter_console_rx_init(void)
 {
-    char *end = NULL;
-    unsigned long mhz = strtoul(tok, &end, 10);
-    if (end == tok || mhz < 1000ul || mhz > 9999ul) {
-        printf("FUSAGE F<mhz> e.g. F5800\n");
+    const int rx = U0RXD_GPIO_NUM, tx = U0TXD_GPIO_NUM;
+    if (rx < 0 || tx < 0) {
+        meter_printf("RSSI_METER console RX: no default UART pins, using ROM path\n");
         return;
     }
-    esp_err_t err = rf_set_frequency_mhz((uint16_t)mhz);
-    printf("F:%lu err=%s f=%u\n",
-           (unsigned long)mhz, esp_err_to_name(err), rf_get_frequency_mhz());
+    if (uart_is_driver_installed(UART_NUM_0)) {
+        s_uart_rx_ready = true;
+        return;
+    }
+    const uart_config_t cfg = {
+        .baud_rate = 115200,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .rx_flow_ctrl_thresh = 0,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+    esp_err_t err = uart_param_config(UART_NUM_0, &cfg);
+    if (err == ESP_OK) err = uart_set_pin(UART_NUM_0, tx, rx, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    if (err == ESP_OK) err = uart_driver_install(UART_NUM_0, 1024, 0, 0, NULL, 0);
+    if (err != ESP_OK) {
+        meter_printf("RSSI_METER console RX: driver failed (%s), using ROM path\n", esp_err_to_name(err));
+        return;
+    }
+    s_uart_rx_ready = true;
+    meter_printf("RSSI_METER console RX: UART0 driver rx=GPIO%d tx=GPIO%d\n", rx, tx);
+}
+
+/* Install the USB-Serial/JTAG driver so the board's USB socket is a real
+ * command input too, not just a place where boot text happens to appear. */
+static void meter_usbjtag_rx_init(void)
+{
+    if (usb_serial_jtag_is_driver_installed()) {
+        s_usbjtag_rx_ready = true;
+        return;
+    }
+    usb_serial_jtag_driver_config_t cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
+    if (usb_serial_jtag_driver_install(&cfg) == ESP_OK) {
+        s_usbjtag_rx_ready = true;
+    } else {
+        meter_printf("RSSI_METER console RX: USB-JTAG driver failed, UART only\n");
+    }
+}
+
+static int meter_getchar(void)
+{
+    if (s_uart_rx_ready) {
+        uint8_t c;
+        if (uart_read_bytes(UART_NUM_0, &c, 1, 0) == 1) {
+            s_out_port = MPORT_UART;
+            return c;
+        }
+    }
+    if (s_usbjtag_rx_ready) {
+        uint8_t c;
+        if (usb_serial_jtag_read_bytes(&c, 1, 0) == 1) {
+            s_out_port = MPORT_USBJTAG;
+            return c;
+        }
+    }
+    if (!s_uart_rx_ready && !s_usbjtag_rx_ready) {
+        /* No driver on either port: only the ROM console path is left. */
+        int c = getchar();
+        if (c >= 0) {
+            s_out_port = MPORT_PRIMARY;
+        }
+        return c;
+    }
+    return -1;
+}
+
+/* Read the rest of the current line (to newline/EOS) into buf. A
+ * previously-read first character may be passed in (the generic fallback
+ * path); pass -1 when the command character was already consumed by the
+ * dispatcher and nothing else has been read. Returns the byte count. */
+static int read_line(char *buf, int len, int first_char)
+{
+    int n = 0;
+    int c = (first_char >= 0) ? first_char : meter_getchar();
+    while (c >= 0 && c != '\n' && c != '\r') {
+        if (n < len - 1) {
+            buf[n++] = (char)c;
+        }
+        c = meter_getchar();
+    }
+    buf[n] = '\0';
+    return n;
+}
+
+/* Same as read_line(), but when the stream goes quiet it waits up to wait_ms
+ * for the next character before deciding the line is finished.
+ *
+ * This is what makes a word command that starts with a single-letter command
+ * letter (SCAN vs S, CH vs C) work: the dispatcher consumes the first letter,
+ * and the rest of the word has to be collected even though it may still be in
+ * flight from the host. A bare key with no arguments still works - it just
+ * costs wait_ms. */
+static int read_line_timeout(char *buf, int len, int first_char, int wait_ms)
+{
+    int n = 0;
+    int64_t deadline_us = esp_timer_get_time() + (int64_t)wait_ms * 1000;
+    int c = (first_char >= 0) ? first_char : meter_getchar();
+    while (c >= 0 && c != '\n' && c != '\r') {
+        if (n < len - 1) {
+            buf[n++] = (char)c;
+        }
+        c = meter_getchar();
+        while (c < 0 && esp_timer_get_time() < deadline_us) {
+            vTaskDelay(pdMS_TO_TICKS(2));
+            c = meter_getchar();
+        }
+    }
+    buf[n] = '\0';
+    return n;
+}
+
+/* Split `s` (modified in place) on spaces into up to `max` tokens. */
+static int tokenize(char *s, char **tok, int max)
+{
+    int n = 0;
+    while (*s && n < max) {
+        while (*s == ' ' || *s == '\t') {
+            ++s;
+        }
+        if (!*s) {
+            break;
+        }
+        tok[n++] = s;
+        while (*s && *s != ' ' && *s != '\t') {
+            ++s;
+        }
+        if (*s) {
+            *s++ = '\0';
+        }
+    }
+    return n;
+}
+
+static uint16_t parse_freq_token(const char *t)
+{
+    /* Named FPV channel (R4, F4, A1, ...) or plain MHz. */
+    if (isalpha((unsigned char)t[0]) && isdigit((unsigned char)t[1]) && !t[2]) {
+        for (size_t i = 0u; i < rf_get_channel_count(); ++i) {
+            const fpv_channel_t *ch = rf_get_channel_at(i);
+            if (ch && toupper((unsigned char)t[0]) == toupper((unsigned char)ch->name[0]) &&
+                t[1] == ch->name[1]) {
+                return ch->freq_mhz;
+            }
+        }
+        return 0;
+    }
+    char *end = NULL;
+    unsigned long mhz = strtoul(t, &end, 10);
+    if (end == t || mhz < 1000ul || mhz > 9999ul) {
+        return 0;
+    }
+    return (uint16_t)mhz;
+}
+
+/* Console tune: also updates the boot frequency that P persists. */
+static void meter_set_frequency(uint16_t mhz)
+{
+    if (mhz == 0) {
+        meter_printf("FUSAGE F<mhz> or F<band><n>, e.g. F5800 / F R4\n");
+        return;
+    }
+    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    esp_err_t err = meter_tune(mhz, now_ms);
+    s_cfg.boot_mhz = mhz;
+    if (s_quiet) {
+        return;   /* node mode owns the port: no console output */
+    }
+    const fpv_channel_t *ch = rf_find_channel_by_freq(s_tuned_mhz, 0);
+    meter_printf("F:%u err=%s%s (P saves as boot frequency)\n",
+           mhz, esp_err_to_name(err), ch ? ch->name : "");
+}
+
+/* Arm the external auto-download circuit, then restart. GPIO10 charges the
+ * gate capacitor through a diode; the MOSFET holds GPIO0 (BOOT) low across
+ * the restart, so the ROM samples download mode and waits for esptool. The RC
+ * discharges in ~1.5 s, so esptool's watchdog finish (seconds later) boots the
+ * new app. Without the hardware this is a plain reboot. */
+static void meter_arm_download_and_restart(void)
+{
+    gpio_config_t arm_io = {
+        .pin_bit_mask = 1ULL << METER_DOWNLOAD_ARM_GPIO,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    if (gpio_config(&arm_io) == ESP_OK) {
+        gpio_set_level(METER_DOWNLOAD_ARM_GPIO, 1);
+        vTaskDelay(pdMS_TO_TICKS(150));
+        gpio_set_level(METER_DOWNLOAD_ARM_GPIO, 0);
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    meter_printf("RSSI_METER download-armed: flash now with "
+           "--before no_reset --after watchdog_reset\n");
+    meter_flush();
+    esp_restart();
+}
+
+/* Walk every named FPV channel and report the strongest: the setup tool a
+ * race timer needs, to find the channel the VTX is actually on.
+ *
+ * The 1 kHz stream is paused for the duration and each channel is judged
+ * from its own raw samples, so the shared signal stage never mixes channels
+ * together. */
+/* SCAN takes exactly one optional argument: the dwell in milliseconds.
+ * Silently reading a frequency range as a dwell was a real trap - "SCAN 5750
+ * 5900 10" used 5750 ms as the dwell and walked all 48 channels. */
+static bool meter_parse_scan_args(char *const *tok, int t, uint32_t *dwell_ms)
+{
+    if (t > 2) {
+        meter_printf("SCAN USAGE SCAN [dwell ms] - extra arguments are not a "
+                     "frequency range; retune with F<mhz> or CH <name>\n");
+        return false;
+    }
+    *dwell_ms = 500u;
+    if (t == 2) {
+        char *end = NULL;
+        unsigned long v = strtoul(tok[1], &end, 10);
+        if (end == tok[1] || (end && *end != '\0')) {
+            meter_printf("SCAN USAGE dwell must be a number of milliseconds\n");
+            return false;
+        }
+        *dwell_ms = (uint32_t)v;
+    }
+    return true;
+}
+
+static void meter_scan(uint32_t dwell_ms)
+{
+    if (dwell_ms < 20u) {
+        dwell_ms = 120u;
+    }
+    if (dwell_ms > 1000u) {
+        dwell_ms = 1000u;
+    }
+
+    uint16_t restore = s_tuned_mhz;
+    bool was_paused = s_stream_paused;
+    s_stream_paused = true;
+
+    const fpv_channel_t *best[3] = {NULL, NULL, NULL};
+    float best_db[3] = {0.0f, 0.0f, 0.0f};
+    size_t measured = 0u;
+    meter_printf("SCAN start dwell=%u ms\n", (unsigned)dwell_ms);
+
+    for (size_t i = 0u; i < rf_get_channel_count(); ++i) {
+        const fpv_channel_t *ch = rf_get_channel_at(i);
+        if (ch == NULL) {
+            continue;
+        }
+        /* Skip duplicate MHz (R7/F8 = 5880) and out-of-window channels. */
+        bool dup = false;
+        for (size_t j = 0u; j < i; ++j) {
+            const fpv_channel_t *prev = rf_get_channel_at(j);
+            if (prev && prev->freq_mhz == ch->freq_mhz) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup || ch->freq_mhz < METER_FREQ_MIN_MHZ ||
+            ch->freq_mhz > METER_FREQ_MAX_MHZ) {
+            continue;
+        }
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        meter_tune(ch->freq_mhz, now_ms);
+        vTaskDelay(pdMS_TO_TICKS(dwell_ms));
+
+        int vals[5];
+        int n = 0;
+        for (int k = 0; k < 5; ++k) {
+            int dbm = -127;
+            if (rf_try_get_wideband_rssi_dbm(&dbm)) {
+                vals[n++] = dbm;
+            }
+            vTaskDelay(pdMS_TO_TICKS(3));
+        }
+        if (n == 0) {
+            meter_printf("SCAN %s %u MHz no reading\n", ch->name, (unsigned)ch->freq_mhz);
+            continue;
+        }
+        for (int a = 1; a < n; ++a) {
+            for (int b = a; b > 0 && vals[b - 1] > vals[b]; --b) {
+                int t = vals[b - 1];
+                vals[b - 1] = vals[b];
+                vals[b] = t;
+            }
+        }
+        float db = (float)vals[n / 2];
+        meter_printf("SCAN %s %u MHz %.1f dB\n", ch->name, (unsigned)ch->freq_mhz, db);
+        measured++;
+
+        for (int s = 0; s < 3; ++s) {
+            if (best[s] == NULL || db > best_db[s]) {
+                for (int m = 2; m > s; --m) {
+                    best[m] = best[m - 1];
+                    best_db[m] = best_db[m - 1];
+                }
+                best[s] = ch;
+                best_db[s] = db;
+                break;
+            }
+        }
+    }
+
+    if (restore != 0) {
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        meter_tune(restore, now_ms);
+    }
+    /* The learned quiet level belongs to one channel; after a scan it is
+     * meaningless, so re-learn it on the restored channel. */
+    rssi_signal_reset_baseline(&s_sig);
+    s_state = METER_STATE_TUNING;
+
+    meter_printf("SCAN done measured=%u", (unsigned)measured);
+    for (int s = 0; s < 3; ++s) {
+        if (best[s]) {
+            meter_printf(" | %s %u MHz %.1f dB", best[s]->name,
+               (unsigned)best[s]->freq_mhz, best_db[s]);
+        }
+    }
+    meter_printf(" restored=%u MHz\n", (unsigned)(restore ? restore : 0u));
+
+    s_stream_paused = was_paused;
+}
+
+/* A numeric token must be a complete number. strtof() happily returns 0.0 for
+ * "AN", and that is how one mistyped console line wrote a 0..120 dBm calibration
+ * window into a live meter. */
+static bool parse_float_strict(const char *s, float *out)
+{
+    if (!s) {
+        return false;
+    }
+    char *end = NULL;
+    float v = strtof(s, &end);
+    if (end == s || (end && *end != '\0')) {
+        return false;
+    }
+    if (!isfinite(v)) {
+        return false;
+    }
+    *out = v;
+    return true;
+}
+
+static void meter_calibration(int argc, char **argv)
+{
+    if (argc == 0) {
+        meter_printf("CAL db_lo=%.1f db_hi=%.1f (0..255)\n",
+               s_sig.cfg.db_lo, s_sig.cfg.db_hi);
+        return;
+    }
+    if (argc == 1 && !strcasecmp(argv[0], "lo")) {
+        float v = rssi_signal_smoothed_db(&s_sig);
+        if (v < -140.0f || v > 10.0f) {
+            meter_printf("CAL refused: current reading %.1f dB is not a valid level\n", v);
+            return;
+        }
+        rssi_signal_set_calibration(&s_sig, v, s_sig.cfg.db_hi);
+        s_cfg.db_lo = v;
+        meter_printf("CAL db_lo=%.1f (from current reading)\n", v);
+        return;
+    }
+    if (argc == 1 && !strcasecmp(argv[0], "hi")) {
+        float v = rssi_signal_smoothed_db(&s_sig);
+        if (v < -140.0f || v > 10.0f) {
+            meter_printf("CAL refused: current reading %.1f dB is not a valid level\n", v);
+            return;
+        }
+        rssi_signal_set_calibration(&s_sig, s_sig.cfg.db_lo, v);
+        s_cfg.db_hi = v;
+        meter_printf("CAL db_hi=%.1f (from current reading)\n", v);
+        return;
+    }
+    if (argc == 2) {
+        float lo = 0.0f, hi = 0.0f;
+        if (!parse_float_strict(argv[0], &lo) || !parse_float_strict(argv[1], &hi)) {
+            meter_printf("CAL refused: both values must be numbers (CUSAGE C <lo> <hi>)\n");
+            return;
+        }
+        /* Physical bounds, same rule meter_cfg_valid() applies to a saved
+         * config: a receiver never reports 0 dBm, and a window narrower than
+         * 5 dB makes the 0..255 output meaningless. */
+        if (lo < -140.0f || lo > -10.0f || hi < -100.0f || hi > 10.0f || hi <= lo + 5.0f) {
+            meter_printf("CAL refused: need lo in -140..-10, hi in -100..10, hi > lo+5 "
+                   "(got %.1f %.1f)\n", lo, hi);
+            return;
+        }
+        rssi_signal_set_calibration(&s_sig, lo, hi);
+        s_cfg.db_lo = lo;
+        s_cfg.db_hi = hi;
+        meter_printf("CAL db_lo=%.1f db_hi=%.1f\n", lo, hi);
+    } else {
+        meter_printf("CALUSAGE C [lo hi] | C lo | C hi\n");
+    }
+}
+
+static void meter_apply_cfg_to_signal(void)
+{
+    rssi_signal_set_calibration(&s_sig, s_cfg.db_lo, s_cfg.db_hi);
+    rssi_signal_set_ema_alpha(&s_sig, s_cfg.ema_alpha);
+    rssi_signal_set_margin(&s_sig, s_cfg.margin_db, s_cfg.hysteresis_db);
+    s_sig.cfg.floor_db = s_cfg.floor_db;
+    s_sig.cfg.baseline_alpha = s_cfg.baseline_alpha;
+    s_sig.cfg.fresh_ms = s_cfg.fresh_ms;
+    s_dac_invert = s_cfg.dac_invert != 0;
+}
+
+static void meter_defaults(void)
+{
+    meter_cfg_t d;
+    meter_cfg_defaults(&d);
+    s_cfg = d;
+    meter_apply_cfg_to_signal();
+    meter_printf("DEFAULTS applied (P saves)\n");
+}
+
+/* ---- Z diagnostics: is the RF front end actually measuring? ----
+ * Two questions this meter cannot answer from the RSSI number alone:
+ *
+ * 1. Is the PHY receiving anything at all? A pure analog FPV transmitter is
+ *    not an 802.11 station, so the Wi-Fi stack only reports frames when real
+ *    preambles are present. The promiscuous callback already installed by
+ *    rf_start() is replaced here, which is safe because the meter has no
+ *    video path to feed. Zero frames with a strong RSSI reading means the
+ *    reading is not a reception event.
+ *
+ * 2. Is the RSSI register alive? A value that never changes is a latched
+ *    register, not a measurement (the signal stage already refuses to call a
+ *    frozen reading 'signal present', see fresh_ms). Z <seconds> prints the
+ *    distinct raw values seen in that window.
+ */
+static volatile uint32_t s_diag_frames;
+static volatile int s_diag_last_rssi = -128;
+static volatile uint8_t s_diag_last_chan;
+static volatile uint8_t s_diag_last_sec;
+
+static void meter_sniffer_cb(void *buf, wifi_promiscuous_pkt_type_t type)
+{
+    (void)type;
+    const wifi_pkt_rx_ctrl_t *c = (const wifi_pkt_rx_ctrl_t *)buf;
+    s_diag_frames++;
+    s_diag_last_rssi = (int)c->rssi;
+    s_diag_last_chan = (uint8_t)c->channel;
+    s_diag_last_sec = (uint8_t)c->second;
+}
+
+static void meter_diag(int seconds)
+{
+    bool was_paused = s_stream_paused;
+    s_stream_paused = true;
+
+    bool sniffer_was = false;
+    (void)esp_wifi_get_promiscuous(&sniffer_was);
+    esp_err_t err = esp_wifi_set_promiscuous_rx_cb(meter_sniffer_cb);
+    if (err != ESP_OK) {
+        meter_printf("Z WARN rx_cb install %s\n", esp_err_to_name(err));
+    }
+    if (!sniffer_was) (void)esp_wifi_set_promiscuous(true);
+
+    uint32_t f0 = s_diag_frames;
+    int seen[16];
+    int nseen = 0;
+    int total = 0;
+    int nf_bad = 0;
+    const int period_ms = (seconds > 0) ? 10 : 1000;
+    const int ticks = (seconds > 0) ? (seconds * 100) : 1;
+
+    for (int i = 0; i < ticks; ++i) {
+        int rssi = -128, nf = -128;
+        bool ok = rf_try_get_wideband_rssi_dbm(&rssi);
+        if (!rf_try_get_noise_floor_dbm(&nf)) nf_bad++;
+        if (ok) {
+            total++;
+            bool dup = false;
+            for (int j = 0; j < nseen; ++j) {
+                if (seen[j] == rssi) { dup = true; break; }
+            }
+            if (!dup && nseen < (int)(sizeof(seen) / sizeof(seen[0]))) {
+                seen[nseen++] = rssi;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(period_ms));
+    }
+
+    uint32_t f1 = s_diag_frames;
+    meter_printf("Z f=%u gain=%d frames=%u (%.0f/s) frame_rssi=%d chan=%u sec=%u\n",
+           (unsigned)s_tuned_mhz, s_meter_gain,
+           (unsigned)(f1 - f0), (double)(f1 - f0) / (double)(ticks * period_ms / 1000),
+           s_diag_last_rssi, s_diag_last_chan, s_diag_last_sec);
+    meter_printf("Z phy_rssi readings=%d distinct=%d", total, nseen);
+    for (int j = 0; j < nseen; ++j) meter_printf(" %d", seen[j]);
+    meter_printf(" nf_invalid=%d/%d\n", nf_bad, ticks);
+    if (nseen <= 1) {
+        meter_printf("Z VERDICT frozen: the PHY RSSI register did not move "
+                     "(%d distinct value in %.1f s) - treat it as latched\n",
+                     nseen, (double)(ticks * period_ms / 1000));
+    }
+    if (sniffer_was) (void)esp_wifi_set_promiscuous_rx_cb(NULL);
+    else (void)esp_wifi_set_promiscuous(false);
+    s_stream_paused = was_paused;
 }
 
 void app_main(void)
 {
+    meter_printf("RSSI_METER start\n");
+    meter_flush();
     if ((uintptr_t)&_bss_end > 0x4082ffc0u) {
-        printf("RSSI_METER ERROR bss_overlaps_dump_banks\n");
+        meter_printf("RSSI_METER ERROR bss_overlaps_dump_banks\n");
         return;
     }
 
@@ -192,13 +1224,32 @@ void app_main(void)
     *usage &= ~0x00010f00u;
     __asm__ __volatile__("fence iorw, iorw" ::: "memory");
 
+    meter_printf("RSSI_METER rf_start...\n");
+    meter_flush();
     esp_err_t err = rf_start();
     if (err != ESP_OK) {
-        printf("RSSI_METER ERROR rf_start=%s\n", esp_err_to_name(err));
+        meter_printf("RSSI_METER ERROR rf_start=%s\n", esp_err_to_name(err));
         return;
     }
+    meter_printf("RSSI_METER rf_start ok\n");
+    meter_flush();
 
-    /* Static DAC pins: outputs, code 0 until the first sample. */
+    /* Load persisted settings before anything else user-visible. */
+    meter_cfg_load(&s_cfg);
+    s_dac_invert = s_cfg.dac_invert != 0;
+
+    /* Static DAC pins: outputs, code 0 until the first sample.
+     *
+     * Console conflict guard: on the ESP32-C5 the console UART default pins
+     * are GPIO 12 (RX) and GPIO 11 (TX) (soc/esp32c5/include/soc/uart_pins.h),
+     * which are DAC bits 3 and 2. Driving them as outputs destroys the serial
+     * link in both directions - the meter could not be talked to over the UART
+     * cable before this guard existed - so a UART-console build must not own
+     * them unless CONFIG_C5VRX_RSSI_DAC_OWN_UART_PINS says the whole ladder is
+     * worth the UART port. The physical ladder network is still wired to the
+     * full tested pin order; only the pins the console owns are left alone.
+     * Either way the board's USB-Serial/JTAG port stays a working console.
+     */
     gpio_config_t dac_cfg = {
         .pin_bit_mask = 0ULL,
         .mode = GPIO_MODE_OUTPUT,
@@ -207,35 +1258,143 @@ void app_main(void)
         .intr_type = GPIO_INTR_DISABLE,
     };
     for (unsigned i = 0u; i < 6u; ++i) {
-        dac_cfg.pin_bit_mask |= 1ULL << (uint32_t)s_dac_gpio[i];
-        gpio_set_level(s_dac_gpio[i], 0);
+#ifdef CONFIG_C5VRX_RSSI_DAC_ENABLE
+        s_dac_active[i] = true;
+#else
+        s_dac_active[i] = false;
+#endif
+#if defined(CONFIG_ESP_CONSOLE_UART) && !CONFIG_C5VRX_RSSI_DAC_OWN_UART_PINS
+        if ((int)s_dac_gpio[i] == U0RXD_GPIO_NUM || (int)s_dac_gpio[i] == U0TXD_GPIO_NUM) {
+            s_dac_active[i] = false;
+        }
+#endif
+        if (s_dac_active[i]) {
+            dac_cfg.pin_bit_mask |= 1ULL << (uint32_t)s_dac_gpio[i];
+            gpio_set_level(s_dac_gpio[i], 0);
+        }
     }
-    if ((err = gpio_config(&dac_cfg)) != ESP_OK) {
-        printf("RSSI_METER ERROR dac_gpio=%s\n", esp_err_to_name(err));
+    if (dac_cfg.pin_bit_mask != 0ULL && (err = gpio_config(&dac_cfg)) != ESP_OK) {
+        meter_printf("RSSI_METER ERROR dac_gpio=%s\n", esp_err_to_name(err));
         return;
     }
+#ifndef CONFIG_C5VRX_RSSI_DAC_ENABLE
+    meter_printf("RSSI_METER dac output disabled (ladder not fitted)\n");
+#elif defined(CONFIG_ESP_CONSOLE_UART) && !CONFIG_C5VRX_RSSI_DAC_OWN_UART_PINS
+    if (!s_dac_active[2] || !s_dac_active[3]) {
+        meter_printf("RSSI_METER dac partial: ladder pins %d/%d are the console UART and stay with the console\n",
+               U0RXD_GPIO_NUM, U0TXD_GPIO_NUM);
+    }
+#endif
 
-    if ((err = rf_set_frequency_mhz(METER_BOOT_FREQ_MHZ)) != ESP_OK) {
-        printf("RSSI_METER WARN tune %u MHz err=%s (staying %u MHz)\n",
-               METER_BOOT_FREQ_MHZ, esp_err_to_name(err), rf_get_frequency_mhz());
+    /* Signal stage (smoothing + calibration + signal presence). */
+    rssi_signal_cfg_t scfg = {
+        .db_lo = s_cfg.db_lo,
+        .db_hi = s_cfg.db_hi,
+        .ema_alpha = s_cfg.ema_alpha,
+        .margin_db = s_cfg.margin_db,
+        .hysteresis_db = s_cfg.hysteresis_db,
+        .floor_db = s_cfg.floor_db,
+        .baseline_alpha = s_cfg.baseline_alpha,
+        .fresh_ms = s_cfg.fresh_ms,
+    };
+    rssi_signal_begin(&s_sig, &scfg);
+
+    /* RotorHazard node engine. Defaults are overwritten by the server as soon
+     * as it polls (WRITE_FREQUENCY / ENTER / EXIT). */
+    s_rf_mutex = xSemaphoreCreateMutex();
+    s_node_mutex = xSemaphoreCreateMutex();
+    rh_node_begin(&s_node, s_cfg.boot_mhz ? s_cfg.boot_mhz : METER_BOOT_FREQ_MHZ,
+                  RH_NODE_ENTER_AT, RH_NODE_EXIT_AT, s_cfg.min_lap_ms);
+    s_node.fw_version = "C5VRX_RSSI_1.0";
+    s_node.fw_build_date = __DATE__;
+    s_node.fw_build_time = __TIME__;
+    s_node.fw_proctype = "ESP32C5";
+    s_node_mode = s_cfg.node_mode != 0;
+    s_quiet = s_node_mode;
+
+    /* Meter operating gain (forced mode only; in native AGC mode the
+     * rf_set_rx_gain() write is refused and the firmware-held default stays). */
+    rf_set_rx_gain(true, METER_DEFAULT_GAIN);
+    s_meter_gain = METER_DEFAULT_GAIN;
+
+    uint16_t boot_mhz = s_cfg.boot_mhz ? s_cfg.boot_mhz : METER_BOOT_FREQ_MHZ;
+    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    meter_tune(boot_mhz, now_ms);
+    if (s_state == METER_STATE_FAULT) {
+        meter_printf("RSSI_METER WARN tune %u MHz failed (staying %u MHz)\n",
+               boot_mhz, rf_get_frequency_mhz());
+        s_state = METER_STATE_IDLE;
     }
 
     if (xTaskCreatePinnedToCore(meter_output_task, "rssi_out", 4096, NULL, 6,
-                                NULL, 1) != pdPASS) {
-        printf("RSSI_METER ERROR output_task\n");
+                                NULL, 0) != pdPASS) {
+        meter_printf("RSSI_METER ERROR output_task\n");
         return;
     }
 
-    printf("RSSI_METER READY f=%u mode=%s stream=1kHz dac=6bit %d..%d dBm\n",
-           rf_get_frequency_mhz(),
+    meter_printf("RSSI_METER READY f=%u mode=%s stream=%s dac=6bit cal=%.0f..%.0f dB\n",
+           s_tuned_mhz,
            rf_native_agc_active() ? "native_agc" : "forced",
-           RSSI_DAC_DBM_LO, RSSI_DAC_DBM_HI);
+           s_node_mode ? "rh_node" : "1kHz",
+           s_sig.cfg.db_lo, s_sig.cfg.db_hi);
+    meter_console_rx_init();
+    meter_usbjtag_rx_init();
     meter_help();
-    fflush(stdout);
+    meter_flush();
 
+    char line[64];
     for (;;) {
-        int c = getchar();
-        if (c < 0) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
+        int c = meter_getchar();
+        if (c < 0) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+        if (s_node_mode) {
+            /* Escape hatches: bytes the RotorHazard protocol does not define,
+             * so a human can still get back out without reflashing. */
+            if (c == 'M' || c == 'm') {
+                s_node_mode = false;
+                s_quiet = false;
+                s_cfg.node_mode = 0;
+                meter_cfg_save(&s_cfg);
+                meter_printf("NODE mode off, console back (1 kHz stream resumes).\n");
+                meter_flush();
+                continue;
+            }
+            if (c == 'T' || c == 't') {
+                /* One status line on a polled port can cost the server one
+                 * failed read; it retries and flushes, so this is safe to use
+                 * sparingly. */
+                meter_status();
+                continue;
+            }
+            node_handle_byte((uint8_t)c);
+            continue;
+        }
+        if (rh_node_is_command((uint8_t)c)) {
+            /* A RotorHazard server poll arrived on a console-mode port. Any
+             * text we print here is read as the reply, so print AFTER the
+             * reply: the server reads exactly payload + checksum, then the
+             * next poll flushes the leftover notice. */
+            node_handle_byte((uint8_t)c);
+            meter_printf("NODE detected (byte 0x%02X): node mode on, console off. Press M to return.\n", c);
+            meter_flush();
+            s_node_mode = true;
+            s_quiet = true;
+            s_cfg.node_mode = 1;
+            meter_cfg_save(&s_cfg);
+            continue;
+        }
+        if (c == 'M' || c == 'm') {
+            s_node_mode = true;
+            s_quiet = true;
+            s_cfg.node_mode = 1;
+            meter_cfg_save(&s_cfg);
+            meter_printf("NODE mode on (RotorHazard protocol, saved). The port now answers "
+                   "server polls only; press M to return to the console.\n");
+            meter_flush();
+            continue;
+        }
         if (c == 'H' || c == 'h') {
             meter_help();
         } else if (c == 'T' || c == 't') {
@@ -243,31 +1402,176 @@ void app_main(void)
         } else if (c == 'N' || c == 'n') {
             bool enable = !rf_native_agc_active();
             err = rf_request_native_agc_boot(enable);
-            printf("RSSI_METER_NATIVE_AGC_ARMED next_boot=%s action=reboot err=%s\n",
+            meter_printf("RSSI_METER_NATIVE_AGC_ARMED next_boot=%s action=reboot err=%s\n",
                    enable ? "native_hw_agc" : "forced_gain", esp_err_to_name(err));
-            fflush(stdout);
+            meter_flush();
             vTaskDelay(pdMS_TO_TICKS(150));
             esp_restart();
         } else if (c == 'S' || c == 's') {
-            meter_gain_sweep();
+            /* 'S' is the gain sweep, but the word command SCAN starts with the
+             * same letter. Without this lookahead "SCAN 120" ran the sweep and
+             * then handed "AN 120" to the calibration command. */
+            read_line_timeout(line, sizeof(line), -1, 60);
+            char *tok[3] = {NULL, NULL, NULL};
+            int t = tokenize(line, tok, 3);
+            if (t >= 1 && !strcasecmp(tok[0], "CAN")) {
+                uint32_t dwell;
+                if (meter_parse_scan_args(tok, t, &dwell)) meter_scan(dwell);
+            } else if (t == 0) {
+                meter_gain_sweep();
+            } else {
+                meter_printf("SUSAGE S (gain sweep) or SCAN [dwell ms]\n");
+            }
         } else if (c == 'V' || c == 'v') {
             s_dac_invert = !s_dac_invert;
-            printf("DAC_POL %s\n", s_dac_invert ? "inverted" : "normal");
+            s_cfg.dac_invert = s_dac_invert;
+            meter_printf("DAC_POL %s (P saves)\n", s_dac_invert ? "inverted" : "normal");
         } else if (c == 'L' || c == 'l') {
             s_stream_paused = !s_stream_paused;
-            printf("STREAM %s\n", s_stream_paused ? "paused" : "running");
+            meter_printf("STREAM %s\n", s_stream_paused ? "paused" : "running");
+        } else if (c == 'B' || c == 'b') {
+            meter_printf("RSSI_METER rebooting\n");
+            meter_flush();
+            vTaskDelay(pdMS_TO_TICKS(100));
+            esp_restart();
+        } else if (c == 'X' || c == 'x') {
+            meter_arm_download_and_restart();
         } else if (c == 'F' || c == 'f') {
-            char tok[8] = {0};
-            unsigned n = 0u;
-            for (;;) {
-                int d = getchar();
-                if (d < 0 || d < '0' || d > '9' || n >= 7u) break;
-                tok[n++] = (char)d;
+            read_line(line, sizeof(line), -1);
+            char *tok[2] = {NULL, NULL};
+            int t = tokenize(line, tok, 2);
+            if (t >= 1) {
+                meter_set_frequency(parse_freq_token(tok[0]));
+            } else {
+                meter_printf("FUSAGE F<mhz> or F<band><n>, e.g. F5800 / F R4\n");
             }
-            meter_set_frequency(tok);
+        } else if (c == 'C' || c == 'c') {
+            /* 'C' is calibration, and the word command CH starts with the same
+             * letter. Same lookahead rule as S/SCAN above. */
+            read_line_timeout(line, sizeof(line), -1, 60);
+            char *tok[3] = {NULL, NULL, NULL};
+            int t = tokenize(line, tok, 3);
+            if (t >= 1 && !strcasecmp(tok[0], "H")) {
+                if (t >= 2) {
+                    meter_set_frequency(parse_freq_token(tok[1]));
+                } else {
+                    meter_printf("CHUSAGE CH <band><n>, e.g. CH R4\n");
+                }
+            } else {
+                meter_calibration(t, tok);
+            }
+        } else if (c == 'E' || c == 'e') {
+            read_line(line, sizeof(line), -1);
+            char *tok[2] = {NULL, NULL};
+            int t = tokenize(line, tok, 2);
+            if (t == 1) {
+                float a = strtof(tok[0], NULL);
+                if (a > 0.0f && a <= 1.0f) {
+                    rssi_signal_set_ema_alpha(&s_sig, a);
+                    s_cfg.ema_alpha = a;
+                    meter_printf("EMA alpha=%.2f (P saves)\n", a);
+                }
+            }
+            if (t != 1) {
+                meter_printf("EUSAGE E <alpha 0.01..1>\n");
+            }
+        } else if (c == 'A' || c == 'a') {
+            read_line(line, sizeof(line), -1);
+            char *tok[2] = {NULL, NULL};
+            int t = tokenize(line, tok, 2);
+            if (t == 1) {
+                float m = strtof(tok[0], NULL);
+                if (m > 0.0f && m <= 60.0f) {
+                    rssi_signal_set_margin(&s_sig, m, s_sig.cfg.hysteresis_db);
+                    s_cfg.margin_db = s_sig.cfg.margin_db;
+                    meter_printf("MARGIN %.1f dB (P saves)\n", s_sig.cfg.margin_db);
+                } else {
+                    meter_printf("AUSAGE A <margin dB 1..60>\n");
+                }
+            } else {
+                meter_printf("SIGNAL present=%d margin=%.1f hyst=%.1f base=%.1f "
+                       "sig=%.1f fresh=%d floor=%.0f\n",
+                       rssi_signal_signal_present(&s_sig) ? 1 : 0,
+                       s_sig.cfg.margin_db, s_sig.cfg.hysteresis_db,
+                       rssi_signal_baseline_db(&s_sig),
+                       rssi_signal_smoothed_db(&s_sig),
+                       rssi_signal_fresh(&s_sig) ? 1 : 0,
+                       s_sig.cfg.floor_db);
+            }
+        } else if (c == 'R' || c == 'r') {
+            /* The learned baseline is the only quiet reference the meter has
+             * (the vendor noise-floor read is invalid in forced-gain mode), so
+             * re-learn it whenever the site or the VTX changes. */
+            rssi_signal_reset_baseline(&s_sig);
+            s_last_signal = false;
+            meter_printf("BASELINE reset (re-learning from the next valid reading)\n");
+        } else if (c == 'P' || c == 'p') {
+            bool ok = meter_cfg_save(&s_cfg);
+            meter_printf("SAVE %s (boot_mhz=%u)\n", ok ? "ok" : "FAILED", s_cfg.boot_mhz);
+        } else if (c == 'Q' || c == 'q') {
+            /* Q [sec] : what the PHY actually reports, unvalidated. */
+            read_line_timeout(line, sizeof(line), -1, 40);
+            char *tok[1] = {NULL};
+            int t = tokenize(line, tok, 1);
+            int secs = (t >= 1) ? (int)strtol(tok[0], NULL, 10) : 0;
+            if (secs < 0 || secs > 120) secs = 0;
+            if (secs == 0) {
+                meter_printf("PHYRAW rssi:%d nf:%d (accepted window "
+                       "rssi:-140..10 nf:-140..-20; %d means the vendor symbol "
+                       "is not linked)\n",
+                       rf_raw_phy_rssi(), rf_raw_phy_noise_floor(),
+                       RF_RAW_SYM_MISSING);
+            } else {
+                meter_printf("REGPROBE running for %d s - toggle the transmitter "
+                       "now, then compare the two runs\n", secs);
+                s_stream_paused = true;
+                xSemaphoreTake(s_rf_mutex, portMAX_DELAY);
+                rf_probe_signal_regs(secs * 4, 250);
+                xSemaphoreGive(s_rf_mutex);
+                s_stream_paused = false;
+            }
+        } else if (c == 'Z' || c == 'z') {
+            read_line_timeout(line, sizeof(line), -1, 40);
+            char *tok[1] = {NULL};
+            int t = tokenize(line, tok, 1);
+            int secs = (t >= 1) ? (int)strtol(tok[0], NULL, 10) : 0;
+            if (secs < 0 || secs > 30) secs = 0;
+            meter_diag(secs);
+        } else if (c == 'D' || c == 'd') {
+            meter_defaults();
+        } else if (c == 'O' || c == 'o') {
+            /* OUT <0..255> | OUT off */
+            read_line(line, sizeof(line), -1);
+            char *tok[2] = {NULL, NULL};
+            int t = tokenize(line, tok, 2);
+            if (t == 1 && !strcasecmp(tok[0], "off")) {
+                s_force_counts = -1;
+                meter_printf("OUT restored\n");
+            } else if (t == 1) {
+                long v = strtol(tok[0], NULL, 10);
+                if (v >= 0 && v <= 255) {
+                    s_force_counts = (int)v;
+                    meter_printf("OUT fixed at %ld\n", v);
+                }
+            } else {
+                meter_printf("OUTUSAGE OUT <0..255> | OUT off\n");
+            }
+        } else if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+            /* skip */
         } else {
-            printf("RSSI_METER unknown cmd=%c (H for help)\n", c);
+            /* Line-style commands: SCAN, CH */
+            read_line(line, sizeof(line), c);
+            char *tok[3] = {NULL, NULL, NULL};
+            int t = tokenize(line, tok, 3);
+            if (t >= 1 && !strcasecmp(tok[0], "SCAN")) {
+                uint32_t dwell;
+                if (meter_parse_scan_args(tok, t, &dwell)) meter_scan(dwell);
+            } else if (t >= 2 && !strcasecmp(tok[0], "CH")) {
+                meter_set_frequency(parse_freq_token(tok[1]));
+            } else if (t >= 1) {
+                meter_printf("RSSI_METER unknown cmd=%s (H for help)\n", tok[0]);
+            }
         }
-        fflush(stdout);
+        meter_flush();
     }
 }

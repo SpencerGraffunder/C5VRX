@@ -17,10 +17,11 @@ turns the C5VRX receiver into the same thing without any video:
 - It tunes to **5800 MHz** by default (retunable at runtime) and reports
   channel power at **~1 kHz** on both:
   - **USB CDC serial**, one line per sample:
-    `R:-72 NF:-95 G:52 M:0` — `R` = signal strength in dBm,
+    `R:-72 NF:-95 G:47 M:0 P:167 S:1` — `R` = signal strength in dBm,
     `NF` = noise floor (the no-transmitter baseline), `G` = internal
     amplifier index, `M` = amplifier mode (0 = fixed, 1 = hardware
-    auto-gain).
+    auto-gain), `P` = calibrated strength 0..255 (what the analog output
+    and the timing node report), `S` = signal present.
   - The **6-bit analog DAC** on the same D4..D9 resistor network the video
     output uses, so a timer MCU can read a plain analog voltage exactly like
     a VRX RSSI pin (−100…−40 dBm mapped to 0..63, clamped).
@@ -30,13 +31,16 @@ turns the C5VRX receiver into the same thing without any video:
 
 | file | change |
 |---|---|
-| `main/rssi_meter_main.c` | new — the meter application: 1 kHz RSSI/noise-floor streamer, 6-bit DAC drive, serial commands |
+| `main/rssi_meter_main.c` | new — the meter application: 1 kHz RSSI/noise-floor streamer, analog outputs, dual-port console, serial commands, receive-liveness watchdog |
+| `main/rssi_signal.c/.h` | new — small self-contained signal stage: EMA smoothing, calibrated dBm→0..255 mapping, learned quiet baseline + signal-present detection with hysteresis, and a freshness rule that refuses to call a frozen (latched) register reading a signal |
+| `main/rh_node.c/.h` | new — RotorHazard USB node protocol (api level 35) so the meter can act as a timing node |
 | `main/rf.c`, `main/rf.h` | new `rf_set_frequency_mhz()` — arbitrary 5 GHz retune (nearest public Wi-Fi center bootstrap + `phy_set_freq()` delta + gain/BW re-assert). This is also the planned SPI frequency-control entry point |
-| `main/Kconfig.projbuild` | new `CONFIG_C5VRX_RSSI_METER` build option |
-| `main/CMakeLists.txt` | meter image builds only `rssi_meter_main.c` + `rf.c` + `arc_phy.c` and no `.bsasm` programs; the normal image builds exactly as before |
-| `sdkconfig.rssi-meter.defaults` | new — config for the meter image |
-| `docs/rssi-meter.md` | new — protocol, commands, build/flash instructions, bench test plan |
-| `tools/flash.py` | `--build-dir` option so alternate images (like the meter) flash with the same script |
+| `main/Kconfig.projbuild` | new `CONFIG_C5VRX_RSSI_METER` build option plus meter output/console options |
+| `main/CMakeLists.txt` | meter image builds only the meter sources and no `.bsasm` programs; the normal image builds exactly as before |
+| `sdkconfig.rssi-meter.defaults`, `sdkconfig.rssi-meter-4mb.defaults` | new — meter image configs (the 4MB one carries the flash-size stamp the image header must match) |
+| `docs/rssi-meter.md` | new — protocol, commands, build/flash instructions, bench plan, bench results |
+| `tools/flash.py`, `tools/flash_rssi_meter.sh` | `--build-dir` for alternate images; a self-service build+flash loop for the meter |
+| `tools/test_rssi_meter.c`, `tools/test_rh_node.c` | new — host unit tests for the signal stage and the node protocol (no board needed) |
 | `.gitignore` | meter build dirs / generated config / release package |
 
 The normal video firmware is not modified and builds unchanged; the meter is
@@ -44,15 +48,46 @@ a separate image. Flash the normal firmware again to restore video.
 
 ## Meter serial commands
 
+Commands work on **either** console port — the board's USB-UART bridge or its
+built-in USB-Serial/JTAG — and the answer comes back on the port you typed on.
+
 | key | action |
 |---|---|
 | `H` | help |
-| `T` | status line (frequency, amplifier mode, DAC range, polarity, paused) |
+| `T` | status line (frequency, mode, state, calibration, signal-present, DAC polarity, console ports) |
 | `N` | toggle hardware auto-gain (persisted, reboots) |
 | `S` | fixed-amplifier sweep G15..G81 (characterizes the RSSI measurement, restores the previous setting) |
-| `F<mhz>` | retune, e.g. `F5800` |
+| `F<mhz>` / `F R4` | retune, e.g. `F5800`, or a named FPV channel |
+| `SCAN [ms]` | measure all 48 FPV channels, report the strongest |
+| `CH R4` | tune to a named channel |
+| `C [lo hi]` | show / set the calibration dB window |
+| `E alpha` | EMA smoothing (1 = off) |
+| `A [db]` | signal-present margin over the learned quiet baseline |
+| `R` | forget the learned baseline and re-learn it |
+| `OUT n` / `OUT off` | fix the analog output level (wiring test) / restore live value |
+| `Q [sec]` | raw PHY values, or a register scan that lists only the registers that move |
+| `Z [sec]` | diagnostics: Wi-Fi frames seen, distinct RSSI values |
+| `P` / `D` | save settings to NVS / restore defaults |
 | `V` | invert DAC polarity |
 | `L` | pause / resume the 1 kHz stream |
+| `M` | RotorHazard USB node mode (persisted, reboots) |
+| `B` | reboot the meter |
+| `X` | arm the external auto-download circuit, then restart (for flashing) |
+
+## Hosting and flashing
+
+The upstream production web flasher is hosted entirely by **GitHub Pages** at
+[https://twotoz.github.io/C5VRX/](https://twotoz.github.io/C5VRX/). There is no VPS
+and no proxy application server: `deploy-web.yml` is the only production web
+deployment, it always checks out trusted `main`, and firmware assets are
+mirrored into the Pages artifact so the browser downloads same-origin from
+[https://twotoz.github.io/C5VRX/](https://twotoz.github.io/C5VRX/).
+
+That Pages site mirrors the **upstream** repository's releases and PR builds.
+This fork does not deploy its own web flasher: the meter image is built and
+flashed locally (`tools/flash_rssi_meter.sh`, or the packaged
+`release-rssi-meter/` archive), and no pull request is ever opened from this
+fork against `Twotoz/C5VRX`.
 
 ## Build (ESP-IDF v6.0.2, same as upstream)
 
